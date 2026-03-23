@@ -1,0 +1,10 @@
+[address]
+i2c_address = 64
+
+[units]
+
+    [unit.A]
+    type = "servo"
+
+    [unit.B]
+    type = "esc"
