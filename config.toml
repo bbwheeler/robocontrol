@@ -8,3 +8,10 @@ i2c_address = 64
 
     [unit.B]
     type = "esc"
+
+[keys]
+
+left = "a"
+right = "d"
+forward = "w"
+backward = "s"
