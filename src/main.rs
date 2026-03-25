@@ -1,115 +1,171 @@
+//! RoboControl
+//! Control servos and ESCs with a PCA9685
+use std::io;
+use std::time::Duration;
+use std::thread;
+
+use anyhow::{Context, Result};
+use crossterm::{
+    event::{self, Event, KeyCode, KeyEventKind},
+    terminal::{disable_raw_mode, enable_raw_mode},
+    execute,
+    cursor,
+};
 use linux_embedded_hal::I2cdev;
 use pwm_pca9685::{Address, Channel, Pca9685};
-use config::Config;
 
-use std::{io, time::Duration, collections::HashMap};
-
-use crossterm::{
-    cursor::position,
-    event::{poll, read, DisableMouseCapture, EnableMouseCapture, Event, KeyCode},
-    execute,
-    terminal::{disable_raw_mode, enable_raw_mode},
-};
-
-const POLLING_MILLIS: u16 = 60;
-
-const STEERING_CHANNEL: u8 = 0;  // PCA9685 channel for steering
-const THROTTLE_CHANNEL: u8 = 1;  // PCA9685 channel for ESC
-
-const STEERING_FULL_LEFT: u16 = 200;    // min PWM for servo
-const STEERING_FULL_RIGHT: u16 = 500;   // max PWM for servo (right)
-const STEERING_CENTER: u16 = 350;  // neutral position
-
-const THROTTLE_STOP: u16 = 300;    // ESC stop signal
-const THROTTLE_FULL_FORWARD: u16 = 400; // ESC forward
-const THROTTLE_BACKWARD: u16 = 200;// ESC backward
-
-fn main() {
-
-    let cfg = Config::builder()
-        .add_source(config::File::with_name("config"))
-        .add_source(config::Environment::with_prefix("CONTROLLER"))
-        .build()
-        .unwrap();
-
-    let cfg_map = cfg.try_deserialize::<HashMap<String, String>>().unwrap();
+const I2C_BUS: &str = "/dev/i2c-1";
+const PCA9685_ADDRESS: u8 = 0x40;
 
 
-    // TODO: Use config for address
-    // TODO: Use config for which servo does what
+const PRESCALE: u8 = 100;
 
-    let dev = I2cdev::new("/dev/i2c-1").unwrap();
-    let address = Address::default();
-    let mut pwm = Pca9685::new(dev, address).unwrap();
+const STEERING_CHANNEL: Channel = Channel::C0;
+const THROTTLE_CHANNEL: Channel = Channel::C1;
 
-    let dev = I2cdev::new("/dev/i2c-1").unwrap(); // Raspberry Pi I²C bus
-    let mut pwm = Pca9685::new(dev);
+const STEER_LEFT: u16    = 1024;
+const STEER_CENTER: u16  = 2047;
+const STEER_RIGHT: u16   = 3071;
+const THROTTLE_REVERSE: u16 = 1024;
+const THROTTLE_NEUTRAL: u16 = 2047;
+const THROTTLE_FORWARD: u16 = 3071;
+const THROTTLE_STEP: u16  = 25;
+const STEERING_STEP: u16  = 50;
 
+struct RoboState {
+    throttle: u16,
+    steering: u16,
+    throttle_step: u16,
+}
 
-    // The servos need 60Hz
-    pwm.set_prescale(100).unwrap(); // TODO: Figure out real frequency
-    pwm.set_pwm_frequency(50.0).unwrap(); // TODO: Figure out real frequency
-    pwm.enable().unwrap();
+impl RoboState {
+    fn new() -> Self {
+        Self { throttle: THROTTLE_NEUTRAL, steering: STEER_CENTER, throttle_step: THROTTLE_STEP }
+    }
+    fn apply_throttle_forward(&mut self) { self.throttle = (self.throttle + self.throttle_step).min(THROTTLE_FORWARD); }
+    fn apply_throttle_reverse(&mut self) { self.throttle = (self.throttle - self.throttle_step).max(THROTTLE_REVERSE); }
+    fn apply_full_throttle(&mut self) { self.throttle = THROTTLE_FORWARD; }
+    fn apply_full_throttle_reverse(&mut self) { self.throttle = THROTTLE_REVERSE; }
+    fn apply_brake(&mut self)            { self.throttle = THROTTLE_NEUTRAL; }
+    fn steer_left(&mut self)             { self.steering = (self.steering - STEERING_STEP).max(STEER_LEFT); }
+    fn steer_right(&mut self)            { self.steering = (self.steering + STEERING_STEP).min(STEER_RIGHT); }
+}
 
-    enable_raw_mode()?;
+struct PwmDriver { pca: Pca9685<I2cdev> }
 
+impl PwmDriver {
+    fn new() -> Result<Self> {
+        let i2c = I2cdev::new(I2C_BUS)
+            .with_context(|| format!("Failed to open I2C bus '{I2C_BUS}'"))?;
+        let address = Address::from(PCA9685_ADDRESS);
+        let mut pca = Pca9685::new(i2c, address)
+            .map_err(|e| anyhow::anyhow!("PCA9685 init error: {:?}", e))?;
+
+        pca.set_prescale(PRESCALE)
+            .map_err(|e| anyhow::anyhow!("set_prescale error: {:?}", e))?;
+
+        pca.enable()
+            .map_err(|e| anyhow::anyhow!("enable error: {:?}", e))?;
+
+        thread::sleep(Duration::from_millis(10));
+        Ok(Self { pca })
+    }
+
+    fn set_pulse(&mut self, channel: Channel, pulse: u16) -> Result<()> {
+        self.pca.set_channel_on_off(channel, 0, pulse)
+            .map_err(|e| anyhow::anyhow!("set_channel_on_off error: {:?}", e))
+    }
+
+    fn apply(&mut self, state: &RoboState) -> Result<()> {
+        self.set_pulse(STEERING_CHANNEL, state.steering)?;
+        self.set_pulse(THROTTLE_CHANNEL, state.throttle)?;
+        Ok(())
+    }
+
+    fn safe_stop(&mut self) {
+        let _ = self.set_pulse(THROTTLE_CHANNEL, THROTTLE_NEUTRAL);
+        let _ = self.set_pulse(STEERING_CHANNEL, STEER_CENTER);
+    }
+}
+
+impl Drop for PwmDriver {
+    fn drop(&mut self) { self.safe_stop(); }
+}
+
+fn render_ui(state: &RoboState) -> Result<()> {
+    use io::Write;
+    use crossterm::{cursor::MoveTo, terminal::{Clear, ClearType}};
     let mut stdout = io::stdout();
-    execute!(stdout)?;
+    execute!(stdout, MoveTo(0, 0), Clear(ClearType::All))?;
+    println!("*** ROBO CONTROLLER ***");
+    println!("");
+    println!("** Controls **");
+    println!("Steering:");
+    println!(" Left: A/←");
+    println!(" Right: D/→");
+    println!(" Forward: W/↑");
+    println!(" Reverse/Brake: S/↓");
+    println!(" Cut Throttle: Space");
+    println!(" Full Throttle: T");
+    println!(" Full Reverse: G");
 
-    if let Err(e) = main_loop() {
-        println!("Error: {e:?}\r");
-    }
-
-    execute!(stdout, DisableMouseCapture)?;
-
-    disable_raw_mode()
-
-    let _dev = pwm.destroy(); // Give the I2C device back
+    println!(" Quit: Q/ESC");
+    println!("");
+    println!("** Current **");
+    println!("Throttle: {}", state.throttle);
+    println!("Steering: {}", state.steering);
+    println!("Throttle Step: {}", state.throttle_step);
+    stdout.flush()?;
+    Ok(())
 }
 
-// TODO: Use config for keybindings
-
-fn read_input() -> Option<KeyCode> {
-    if event::poll(Duration::from_millis(POLLING_MILLIS)).unwrap() {
-        if let Event::Key(key_event) = event::read().unwrap() {
-            return Some(key_event.code);
-        }
-    }
-    None
+fn arm_esc(driver: &mut PwmDriver) -> Result<()> {
+    println!("Arming ESC — sending neutral throttle for 2 s…");
+    driver.set_pulse(THROTTLE_CHANNEL, THROTTLE_NEUTRAL)?;
+    driver.set_pulse(STEERING_CHANNEL, STEER_CENTER)?;
+    thread::sleep(Duration::from_secs(2));
+    println!("ESC armed. Starting controller…");
+    thread::sleep(Duration::from_millis(500));
+    Ok(())
 }
 
-fn main_loop() -> io::Result<()> {
+fn main() -> Result<()> {
+    env_logger::init();
+    let mut driver = PwmDriver::new().context("Failed to initialise PCA9685")?;
+    arm_esc(&mut driver)?;
+    let mut state = RoboState::new();
+    enable_raw_mode().context("Failed to enable raw terminal mode")?;
+    execute!(io::stdout(), cursor::Hide)?;
+    render_ui(&state)?;
+    let result = run_loop(&mut driver, &mut state);
+    let _ = disable_raw_mode();
+    let _ = execute!(io::stdout(), cursor::Show);
+    driver.safe_stop();
+    println!("\nRC robo controller stopped. Goodbye!");
+    result
+}
 
-    let mut servo_pos = SERVO_CENTER;
-    let mut motor_pwm = MOTOR_STOP;
-
+fn run_loop(driver: &mut PwmDriver, state: &mut RoboState) -> Result<()> {
     loop {
-        if let Some(key) = read_input() {
-            match key {
-                KeyCode::Char('0') => {
-                    pwm.set_channel_on_off(Channel::from(MOTOR_CHANNEL), 0, MOTOR_STOP).unwrap();
-                    sleep(Duration::from_secs(2)); // Arm the ESC
+        if event::poll(Duration::from_millis(50))? {
+            if let Event::Key(key) = event::read()? {
+                if key.kind == KeyEventKind::Press {
+                    match key.code {
+                        KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc   => break,
+                        KeyCode::Char('w') | KeyCode::Char('W') | KeyCode::Up    => state.apply_throttle_forward(),
+                        KeyCode::Char('s') | KeyCode::Char('S') | KeyCode::Down  => state.apply_throttle_reverse(),
+                        KeyCode::Char('t') | KeyCode::Char('T')                  => state.apply_full_throttle(),
+                        KeyCode::Char('g') | KeyCode::Char('G')                  => state.apply_full_throttle_reverse(),
+                        KeyCode::Char(' ')                                       => state.apply_brake(),
+                        KeyCode::Char('a') | KeyCode::Char('A') | KeyCode::Left  => state.steer_left(),
+                        KeyCode::Char('d') | KeyCode::Char('D') | KeyCode::Right => state.steer_right(),
+                        _                                                        => continue,
+                    }
+                    driver.apply(state)?;
+                    render_ui(state)?;
                 }
-                KeyCode::Char('a') => {
-                    servo_pos = servo_pos.saturating_sub(10); // turn left
-                    if servo_pos < SERVO_LEFT { servo_pos = SERVO_LEFT; }
-                }
-                KeyCode::Char('d') => {
-                    servo_pos = servo_pos.saturating_add(10); // turn right
-                    if servo_pos > SERVO_RIGHT { servo_pos = SERVO_RIGHT; }
-                }
-                KeyCode::Char('w') => motor_pwm = MOTOR_FORWARD,   // forward
-                KeyCode::Char('s') => motor_pwm = MOTOR_BACKWARD,  // backward
-                KeyCode::Char(' ') => motor_pwm = MOTOR_STOP, // stop
-                KeyCode::Esc => break,  // exit
-                _ => {}
             }
-
-            // Update PCA9685
-            pwm.set_channel_on_off(Channel::from(SERVO_CHANNEL), 0, servo_pos).unwrap();
-            pwm.set_channel_on_off(Channel::from(MOTOR_CHANNEL), 0, motor_pwm).unwrap();
         }
-
-        sleep(Duration::from_millis(POLLING_MILLIS/3)); // small delay to reduce CPU usage
     }
+    Ok(())
 }
