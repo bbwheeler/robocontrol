@@ -17,38 +17,37 @@ use pwm_pca9685::{Address, Channel, Pca9685};
 const I2C_BUS: &str = "/dev/i2c-1";
 const PCA9685_ADDRESS: u8 = 0x40;
 
-
 const PRESCALE: u8 = 100;
 
 const STEERING_CHANNEL: Channel = Channel::C0;
 const THROTTLE_CHANNEL: Channel = Channel::C1;
 
-const STEER_LEFT: u16    = 1024;
-const STEER_CENTER: u16  = 2047;
-const STEER_RIGHT: u16   = 3071;
-const THROTTLE_REVERSE: u16 = 1024;
-const THROTTLE_NEUTRAL: u16 = 2047;
-const THROTTLE_FORWARD: u16 = 3071;
-const THROTTLE_STEP: u16  = 25;
-const STEERING_STEP: u16  = 50;
+const STEER_LEFT_MAX: u16    = 380;
+const STEER_CENTER: u16  = 500;
+const STEER_RIGHT_MAX: u16   = 620;
+
+const THROTTLE_REVERSE_MAX: u16 = 200;
+const THROTTLE_NEUTRAL: u16 = 400;
+const THROTTLE_FORWARD_MAX: u16 = 600;
+const THROTTLE_STEP: u16  = 20;
+const STEERING_STEP: u16  = 20;
 
 struct RoboState {
     throttle: u16,
     steering: u16,
-    throttle_step: u16,
 }
 
 impl RoboState {
     fn new() -> Self {
-        Self { throttle: THROTTLE_NEUTRAL, steering: STEER_CENTER, throttle_step: THROTTLE_STEP }
+        Self { throttle: THROTTLE_NEUTRAL, steering: STEER_CENTER }
     }
-    fn apply_throttle_forward(&mut self) { self.throttle = (self.throttle + self.throttle_step).min(THROTTLE_FORWARD); }
-    fn apply_throttle_reverse(&mut self) { self.throttle = (self.throttle - self.throttle_step).max(THROTTLE_REVERSE); }
-    fn apply_full_throttle(&mut self) { self.throttle = THROTTLE_FORWARD; }
-    fn apply_full_throttle_reverse(&mut self) { self.throttle = THROTTLE_REVERSE; }
+    fn apply_throttle_forward(&mut self) { self.throttle = (self.throttle + THROTTLE_STEP).min(THROTTLE_FORWARD_MAX); }
+    fn apply_throttle_reverse(&mut self) { self.throttle = (self.throttle - THROTTLE_STEP).max(THROTTLE_REVERSE_MAX); }
+    fn apply_full_throttle(&mut self) { self.throttle = THROTTLE_FORWARD_MAX; }
+    fn apply_full_throttle_reverse(&mut self) { self.throttle = THROTTLE_REVERSE_MAX; }
     fn apply_brake(&mut self)            { self.throttle = THROTTLE_NEUTRAL; }
-    fn steer_left(&mut self)             { self.steering = (self.steering - STEERING_STEP).max(STEER_LEFT); }
-    fn steer_right(&mut self)            { self.steering = (self.steering + STEERING_STEP).min(STEER_RIGHT); }
+    fn steer_left(&mut self)             { self.steering = (self.steering - STEERING_STEP).max(STEER_LEFT_MAX); }
+    fn steer_right(&mut self)            { self.steering = (self.steering + STEERING_STEP).min(STEER_RIGHT_MAX); }
 }
 
 struct PwmDriver { pca: Pca9685<I2cdev> }
@@ -67,7 +66,6 @@ impl PwmDriver {
         pca.enable()
             .map_err(|e| anyhow::anyhow!("enable error: {:?}", e))?;
 
-        thread::sleep(Duration::from_millis(10));
         Ok(Self { pca })
     }
 
@@ -114,7 +112,6 @@ fn render_ui(state: &RoboState) -> Result<()> {
     println!("** Current **");
     println!("Throttle: {}", state.throttle);
     println!("Steering: {}", state.steering);
-    println!("Throttle Step: {}", state.throttle_step);
     stdout.flush()?;
     Ok(())
 }
