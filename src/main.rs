@@ -31,7 +31,7 @@ impl RoboState {
             channel_steps: [0; 16],
         }
     }
-    fn 
+    fn increase_channel(&mut self, channel)
     fn apply_throttle_forward(&mut self) { self.throttle = (self.throttle + THROTTLE_STEP).min(THROTTLE_FORWARD_MAX); }
     fn apply_throttle_reverse(&mut self) { self.throttle = (self.throttle - THROTTLE_STEP).max(THROTTLE_REVERSE_MAX); }
     fn apply_full_throttle(&mut self) { self.throttle = THROTTLE_FORWARD_MAX; }
