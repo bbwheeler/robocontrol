@@ -13,34 +13,25 @@ use crossterm::{
 };
 use linux_embedded_hal::I2cdev;
 use pwm_pca9685::{Address, Channel, Pca9685};
-
-const I2C_BUS: &str = "/dev/i2c-1";
-const PCA9685_ADDRESS: u8 = 0x40;
-
-const PRESCALE: u8 = 100;
-
-const STEERING_CHANNEL: Channel = Channel::C0;
-const THROTTLE_CHANNEL: Channel = Channel::C1;
-
-const STEER_LEFT_MAX: u16    = 380;
-const STEER_CENTER: u16  = 500;
-const STEER_RIGHT_MAX: u16   = 620;
-
-const THROTTLE_REVERSE_MAX: u16 = 200;
-const THROTTLE_NEUTRAL: u16 = 400;
-const THROTTLE_FORWARD_MAX: u16 = 600;
-const THROTTLE_STEP: u16  = 20;
-const STEERING_STEP: u16  = 20;
+use config::Config;
 
 struct RoboState {
-    throttle: u16,
-    steering: u16,
+    channel_values: [u16; 16],
+    channel_max_values: [u16; 16],
+    channel_min_values: [u16; 16],
+    channel_steps: [u16; 16],
 }
 
 impl RoboState {
     fn new() -> Self {
-        Self { throttle: THROTTLE_NEUTRAL, steering: STEER_CENTER }
+        Self {
+            channel_values: [0; 16],
+            channel_max_values: [0; 16],
+            channel_min_values: [0; 16],
+            channel_steps: [0; 16],
+        }
     }
+    fn 
     fn apply_throttle_forward(&mut self) { self.throttle = (self.throttle + THROTTLE_STEP).min(THROTTLE_FORWARD_MAX); }
     fn apply_throttle_reverse(&mut self) { self.throttle = (self.throttle - THROTTLE_STEP).max(THROTTLE_REVERSE_MAX); }
     fn apply_full_throttle(&mut self) { self.throttle = THROTTLE_FORWARD_MAX; }
@@ -53,14 +44,14 @@ impl RoboState {
 struct PwmDriver { pca: Pca9685<I2cdev> }
 
 impl PwmDriver {
-    fn new() -> Result<Self> {
-        let i2c = I2cdev::new(I2C_BUS)
-            .with_context(|| format!("Failed to open I2C bus '{I2C_BUS}'"))?;
-        let address = Address::from(PCA9685_ADDRESS);
+    fn new(ic2_bus_path: &str, ic2_address: u8, prescale: u8) -> Result<Self> {
+        let i2c = I2cdev::new(ic2_bus_path)
+            .with_context(|| format!("Failed to open I2C bus '{ic2_bus_path}'"))?;
+        let address = Address::from(ic2_address);
         let mut pca = Pca9685::new(i2c, address)
             .map_err(|e| anyhow::anyhow!("PCA9685 init error: {:?}", e))?;
 
-        pca.set_prescale(PRESCALE)
+        pca.set_prescale(prescale)
             .map_err(|e| anyhow::anyhow!("set_prescale error: {:?}", e))?;
 
         pca.enable()
@@ -128,6 +119,29 @@ fn arm_esc(driver: &mut PwmDriver) -> Result<()> {
 
 fn main() -> Result<()> {
     env_logger::init();
+
+    let cfg= load_configuration()?;
+
+
+const I2C_BUS: &str = "/dev/i2c-1";
+const PCA9685_ADDRESS: u8 = 0x40;
+
+const PRESCALE: u8 = 100;
+
+const STEERING_CHANNEL: Channel = Channel::C0;
+const THROTTLE_CHANNEL: Channel = Channel::C1;
+
+const STEER_LEFT_MAX: u16    = 380;
+const STEER_CENTER: u16  = 500;
+const STEER_RIGHT_MAX: u16   = 620;
+
+const THROTTLE_REVERSE_MAX: u16 = 200;
+const THROTTLE_NEUTRAL: u16 = 400;
+const THROTTLE_FORWARD_MAX: u16 = 600;
+const THROTTLE_STEP: u16  = 20;
+const STEERING_STEP: u16  = 20;
+    
+
     let mut driver = PwmDriver::new().context("Failed to initialise PCA9685")?;
     arm_esc(&mut driver)?;
     let mut state = RoboState::new();
@@ -140,6 +154,17 @@ fn main() -> Result<()> {
     driver.safe_stop();
     println!("\nRC robo controller stopped. Goodbye!");
     result
+}
+
+fn load_configuration() -> Result<HashMap<String,String>> {
+    let settings = Config::builder()
+        .add_source(config::File::with_name("config"))
+        .add_source(config::Environment::with_prefix("APP"))
+        .build()    
+            .map_err(|e| anyhow::anyhow!("config error: {:?}", e));
+
+        return settings    
+            .try_deserialize::<HashMap<String, String>>();
 }
 
 fn run_loop(driver: &mut PwmDriver, state: &mut RoboState) -> Result<()> {
