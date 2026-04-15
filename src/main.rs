@@ -3,6 +3,7 @@
 use std::io;
 use std::time::Duration;
 use std::thread;
+use std::collections::HashMap;
 
 use anyhow::{Context, Result};
 use crossterm::{
@@ -15,7 +16,7 @@ use linux_embedded_hal::I2cdev;
 use pwm_pca9685::{Address, Channel, Pca9685};
 use config::Config;
 
-const NUMBER_OF_CHANNELS: u8 = 16;
+const NUMBER_OF_CHANNELS: usize = 16;
 
 // const I2C_BUS: &str = "/dev/i2c-1";
 // const PCA9685_ADDRESS: u8 = 0x40;
@@ -41,6 +42,7 @@ struct RoboState {
     channel_min_values: [u16; NUMBER_OF_CHANNELS],
     channel_neutral_values: [u16; NUMBER_OF_CHANNELS],
     channel_steps: [u16; NUMBER_OF_CHANNELS],
+    channels: [Channel; NUMBER_OF_CHANNELS],
 }
 
 impl RoboState {
@@ -51,13 +53,14 @@ impl RoboState {
             channel_min_values: [0; NUMBER_OF_CHANNELS],
             channel_steps: [0; NUMBER_OF_CHANNELS],
             channel_neutral_values: [0; NUMBER_OF_CHANNELS],
+            channels: [Channel::All; NUMBER_OF_CHANNELS],
         }
     }
     // fn increase_channel(&mut self, channel)
     fn apply_throttle_forward(&mut self) { self.channel_values[1] = (self.channel_values[1] + self.channel_steps[1]).min(self.channel_max_values[1]); }
-    fn apply_throttle_reverse(&mut self) { self.channel_values[1] = (self.channel_values[1] - channel_steps[1]).max(self.channel_min_values[1]); }
-    fn steer_left(&mut self)             { self.channel_values[0] = (self.channel_values[0] - channel_steps[0]).max(self.channel_min_values[0]); }
-    fn steer_right(&mut self)            { self.channel_steps[0] = (self.channel_steps[0] + self.channel_steps[0]).min(self.channel_max_values[0]); }
+    fn apply_throttle_reverse(&mut self) { self.channel_values[1] = (self.channel_values[1] - self.channel_steps[1]).max(self.channel_min_values[1]); }
+    fn steer_left(&mut self)             { self.channel_values[0] = (self.channel_values[0] - self.channel_steps[0]).max(self.channel_min_values[0]); }
+    fn steer_right(&mut self)            { self.channel_values[0] = (self.channel_values[0] + self.channel_steps[0]).min(self.channel_max_values[0]); }
 }
 
 struct PwmDriver { pca: Pca9685<I2cdev> }
@@ -92,7 +95,7 @@ impl PwmDriver {
         Ok(())
     }
 
-    fn safe_stop(&mut self) {
+    fn safe_stop(&mut self, state: &RoboState) {
         for c in 0..NUMBER_OF_CHANNELS {
             self.set_pulse(c, state.channel_neutral_values[c])?;
         } 
@@ -130,10 +133,8 @@ fn render_ui(state: &RoboState) -> Result<()> {
     Ok(())
 }
 
-fn arm_esc(driver: &mut PwmDriver) -> Result<()> {
-    println!("Arming ESC — sending neutral throttle for 2 s…");
-    driver.set_pulse(THROTTLE_CHANNEL, THROTTLE_NEUTRAL)?;
-    driver.set_pulse(STEERING_CHANNEL, STEER_CENTER)?;
+fn arm_esc(driver: &mut PwmDriver, state: &RoboState) -> Result<()> {
+    println!("Arming ESC — sending neutral for 2 s…");
 
     for c in 0..NUMBER_OF_CHANNELS {
         driver.set_pulse(c, state.channel_neutral_values[c])?;
@@ -149,10 +150,10 @@ fn main() -> Result<()> {
 
     let cfg= load_configuration()?;
 
-
     let mut driver = PwmDriver::new().context("Failed to initialise PCA9685")?;
     arm_esc(&mut driver)?;
     let mut state = RoboState::new();
+    apply_configuration(state)?;
     enable_raw_mode().context("Failed to enable raw terminal mode")?;
     execute!(io::stdout(), cursor::Hide)?;
     render_ui(&state)?;
@@ -173,6 +174,60 @@ fn load_configuration() -> Result<HashMap<String,String>> {
 
         return settings    
             .try_deserialize::<HashMap<String, String>>();
+
+}
+
+fn apply_configuration(state: &mut RoboState) {
+    for c in NUMBER_OF_CHANNELS {
+        if c == 0 {
+            state.channels[c] = Channel::C0;
+        }
+        if c == 1 {
+            state.channels[c] = Channel::C1;
+        }
+        if c == 2 {
+            state.channels[c] = Channel::C2;
+        }
+        if c == 3 {
+            state.channels[c] = Channel::C3;
+        }
+        if c == 4 {
+            state.channels[c] = Channel::C4;
+        }
+        if c == 5 {
+            state.channels[c] = Channel::C5;
+        }
+        if c == 6 {
+            state.channels[c] = Channel::C6;
+        }
+        if c == 7 {
+            state.channels[c] = Channel::C7;
+        }
+        if c == 8 {
+            state.channels[c] = Channel::C8;
+        }
+        if c == 9 {
+            state.channels[c] = Channel::C9;
+        }
+        if c == 10 {
+            state.channels[c] = Channel::C10;
+        }
+        if c == 11 {
+            state.channels[c] = Channel::C11;
+        }
+        if c == 12 {
+            state.channels[c] = Channel::C12;
+        }
+        if c == 13 {
+            state.channels[c] = Channel::C13;
+        }
+        if c == 14 {
+            state.channels[c] = Channel::C14;
+        }
+        if c == 15 {
+            state.channels[c] = Channel::C15;
+        }
+    }
 }
 
 
