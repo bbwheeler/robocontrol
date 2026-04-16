@@ -150,6 +150,8 @@ fn main() -> Result<()> {
 
     let cfg= load_configuration()?;
 
+    apply_configuration(state, cfg);
+
     let mut driver = PwmDriver::new().context("Failed to initialise PCA9685")?;
     arm_esc(&mut driver)?;
     let mut state = RoboState::new();
@@ -177,57 +179,61 @@ fn load_configuration() -> Result<HashMap<String,String>> {
 
 }
 
-fn apply_configuration(state: &mut RoboState) {
+fn apply_configuration(state: &mut RoboState, cfg: HashMap<String, String>) {
     for c in NUMBER_OF_CHANNELS {
         if c == 0 {
             state.channels[c] = Channel::C0;
         }
-        if c == 1 {
+        else if c == 1 {
             state.channels[c] = Channel::C1;
         }
-        if c == 2 {
+        else if c == 2 {
             state.channels[c] = Channel::C2;
         }
-        if c == 3 {
+        else if c == 3 {
             state.channels[c] = Channel::C3;
         }
-        if c == 4 {
+        else if c == 4 {
             state.channels[c] = Channel::C4;
         }
-        if c == 5 {
+        else if c == 5 {
             state.channels[c] = Channel::C5;
         }
-        if c == 6 {
+        else if c == 6 {
             state.channels[c] = Channel::C6;
         }
-        if c == 7 {
+        else if c == 7 {
             state.channels[c] = Channel::C7;
         }
-        if c == 8 {
+        else if c == 8 {
             state.channels[c] = Channel::C8;
         }
-        if c == 9 {
+        else if c == 9 {
             state.channels[c] = Channel::C9;
         }
-        if c == 10 {
+        else if c == 10 {
             state.channels[c] = Channel::C10;
         }
-        if c == 11 {
+        else if c == 11 {
             state.channels[c] = Channel::C11;
         }
-        if c == 12 {
+        else if c == 12 {
             state.channels[c] = Channel::C12;
         }
-        if c == 13 {
+        else if c == 13 {
             state.channels[c] = Channel::C13;
         }
-        if c == 14 {
+        else if c == 14 {
             state.channels[c] = Channel::C14;
         }
-        if c == 15 {
+        else if c == 15 {
             state.channels[c] = Channel::C15;
+        } else {
+            // TODO: return an error here saying more than 16 channels is unsupported
         }
     }
+
+    
 }
 
 
