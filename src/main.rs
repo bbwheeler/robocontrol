@@ -3,7 +3,6 @@
 use std::io;
 use std::time::Duration;
 use std::thread;
-use std::collections::HashMap;
 
 use anyhow::{Context, Result};
 use crossterm::{
@@ -16,52 +15,99 @@ use linux_embedded_hal::I2cdev;
 use pwm_pca9685::{Address, Channel, Pca9685};
 use config::Config;
 
+use serde::Deserialize;
+
 const NUMBER_OF_CHANNELS: usize = 16;
 
-// const I2C_BUS: &str = "/dev/i2c-1";
-// const PCA9685_ADDRESS: u8 = 0x40;
-
-// const PRESCALE: u8 = 100;
-
-// const STEERING_CHANNEL: Channel = Channel::C0;
-// const THROTTLE_CHANNEL: Channel = Channel::C1;
-
-// const STEER_LEFT_MAX: u16    = 380;
-// const STEER_CENTER: u16  = 500;
-// const STEER_RIGHT_MAX: u16   = 620;
-
-// const THROTTLE_REVERSE_MAX: u16 = 200;
-// const THROTTLE_NEUTRAL: u16 = 400;
-// const THROTTLE_FORWARD_MAX: u16 = 600;
-// const THROTTLE_STEP: u16  = 20;
-// const STEERING_STEP: u16  = 20;
-
-struct RoboState {
-    channel_values: [u16; NUMBER_OF_CHANNELS],
-    channel_max_values: [u16; NUMBER_OF_CHANNELS],
-    channel_min_values: [u16; NUMBER_OF_CHANNELS],
-    channel_neutral_values: [u16; NUMBER_OF_CHANNELS],
-    channel_steps: [u16; NUMBER_OF_CHANNELS],
-    channels: [Channel; NUMBER_OF_CHANNELS],
+#[derive(Debug, Deserialize)]
+struct I2cConfig {
+    address: u8,
+    path: String,
 }
 
-impl RoboState {
-    fn new() -> Self {
-        Self {
-            channel_values: [0; NUMBER_OF_CHANNELS],
-            channel_max_values: [0; NUMBER_OF_CHANNELS],
-            channel_min_values: [0; NUMBER_OF_CHANNELS],
-            channel_steps: [0; NUMBER_OF_CHANNELS],
-            channel_neutral_values: [0; NUMBER_OF_CHANNELS],
-            channels: [Channel::All; NUMBER_OF_CHANNELS],
+#[derive(Debug, Deserialize)]
+struct PwmConfig {
+    prescale: u32,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawChannelConfig {
+    pwm_channel: u8,
+    min: u16,
+    max: u16,
+    neutral: u16,
+    step: u16,
+    mavlink_channel: u8,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawConfig {
+    i2c: I2cConfig,
+    pwm: PwmConfig,
+    channel: Vec<RawChannelConfig>,
+}
+
+struct ChannelConfig {
+    pwm_channel: Channel,
+    min: u16,
+    max: u16,
+    neutral: u16,
+    step: u16,
+    mavlink_channel: u8,
+    current_value: u16
+}
+
+struct AppConfig {
+    i2c: I2cConfig,
+    pwm: PwmConfig,
+    channel: [ChannelConfig; NUMBER_OF_CHANNELS],
+}
+
+impl AppConfig {
+    fn from_raw(raw: RawConfig) -> Result<Self> {
+        while raw.channel.len() < NUMBER_OF_CHANNELS {
+            raw.channel.push(nil);
         }
+        
+        let channels: [ChannelConfig; 16] = raw.channel.try_into()?;
+        Ok(Self { i2c: raw.i2c, pwm: raw.pwm, channel: channels })
     }
-    // fn increase_channel(&mut self, channel)
-    fn apply_throttle_forward(&mut self) { self.channel_values[1] = (self.channel_values[1] + self.channel_steps[1]).min(self.channel_max_values[1]); }
-    fn apply_throttle_reverse(&mut self) { self.channel_values[1] = (self.channel_values[1] - self.channel_steps[1]).max(self.channel_min_values[1]); }
-    fn steer_left(&mut self)             { self.channel_values[0] = (self.channel_values[0] - self.channel_steps[0]).max(self.channel_min_values[0]); }
-    fn steer_right(&mut self)            { self.channel_values[0] = (self.channel_values[0] + self.channel_steps[0]).min(self.channel_max_values[0]); }
 }
+
+impl TryFrom<RawChannelConfig> for ChannelConfig {
+    type Error = String;
+
+    fn try_from(raw: RawChannelConfig) -> Result<Self, Self::Error> {
+        Ok(Self {
+            pwm_channel: channel_from_u8(raw.pwm_channel)
+                .ok_or(format!("Invalid pwm_channel: {}", raw.pwm_channel))?,
+            min: raw.min,
+            max: raw.max,
+            neutral: raw.neutral,
+            step: raw.step,
+            mavlink_channel: raw.mavlink_channel,
+            current_value: raw.neutral,
+        })
+    }
+}
+
+// impl RoboState {
+//     fn new() -> Self {
+//         Self {
+//             channel_values: [0; NUMBER_OF_CHANNELS],
+//             channel_max_values: [0; NUMBER_OF_CHANNELS],
+//             channel_min_values: [0; NUMBER_OF_CHANNELS],
+//             channel_steps: [0; NUMBER_OF_CHANNELS],
+//             channel_neutral_values: [0; NUMBER_OF_CHANNELS],
+//             channels: [Channel::All; NUMBER_OF_CHANNELS],
+//         }
+//     }
+//     // fn increase_channel(&mut self, channel)
+//     fn apply_throttle_forward(&mut self) { self.channel_values[1] = (self.channel_values[1] + self.channel_steps[1]).min(self.channel_max_values[1]); }
+//     fn apply_throttle_reverse(&mut self) { self.channel_values[1] = (self.channel_values[1] - self.channel_steps[1]).max(self.channel_min_values[1]); }
+//     fn steer_left(&mut self)             { self.channel_values[0] = (self.channel_values[0] - self.channel_steps[0]).max(self.channel_min_values[0]); }
+//     fn steer_right(&mut self)            { self.channel_values[0] = (self.channel_values[0] + self.channel_steps[0]).min(self.channel_max_values[0]); }
+// }
 
 struct PwmDriver { pca: Pca9685<I2cdev> }
 
@@ -87,17 +133,17 @@ impl PwmDriver {
             .map_err(|e| anyhow::anyhow!("set_channel_on_off error: {:?}", e))
     }
 
-    fn apply(&mut self, state: &RoboState) -> Result<()> {
+    fn apply(&mut self, state: &AppConfig) -> Result<()> {
         for c in 0..NUMBER_OF_CHANNELS {
-            self.set_pulse(c, state.channel_values[c])?;
+            self.set_pulse(state.channel[c].pwm_channel, state.channel[c].current_value)?;
 
         } 
         Ok(())
     }
 
-    fn safe_stop(&mut self, state: &RoboState) {
+    fn safe_stop(&mut self, state: &AppConfig) {
         for c in 0..NUMBER_OF_CHANNELS {
-            self.set_pulse(c, state.channel_neutral_values[c])?;
+            self.set_pulse(state.channel[c].pwm_channel, state.channel[c].neutral)?;
         } 
     }
 }
@@ -106,7 +152,7 @@ impl Drop for PwmDriver {
     fn drop(&mut self) { self.safe_stop(); }
 }
 
-fn render_ui(state: &RoboState) -> Result<()> {
+fn render_ui(state: &AppConfig) -> Result<()> {
     use io::Write;
     use crossterm::{cursor::MoveTo, terminal::{Clear, ClearType}};
     let mut stdout = io::stdout();
@@ -127,17 +173,17 @@ fn render_ui(state: &RoboState) -> Result<()> {
     println!("");
     println!("** Current **");
     for c in 0..NUMBER_OF_CHANNELS {
-        println!("Channel {}: {}", c, state.channel_values[c]);
+        println!("Channel {}: {}", c, state.channel[c].current_value);
     } 
     stdout.flush()?;
     Ok(())
 }
 
-fn arm_esc(driver: &mut PwmDriver, state: &RoboState) -> Result<()> {
+fn arm_esc(driver: &mut PwmDriver, state: &AppConfig) -> Result<()> {
     println!("Arming ESC — sending neutral for 2 s…");
 
     for c in 0..NUMBER_OF_CHANNELS {
-        driver.set_pulse(c, state.channel_neutral_values[c])?;
+        driver.set_pulse(c, state.channel[c].neutral)?;
     } 
     thread::sleep(Duration::from_secs(2));
     println!("ESCs armed.");
@@ -148,14 +194,10 @@ fn arm_esc(driver: &mut PwmDriver, state: &RoboState) -> Result<()> {
 fn main() -> Result<()> {
     env_logger::init();
 
-    let cfg= load_configuration()?;
-
-    apply_configuration(state, cfg);
+    let state = load_configuration()?;
 
     let mut driver = PwmDriver::new().context("Failed to initialise PCA9685")?;
     arm_esc(&mut driver)?;
-    let mut state = RoboState::new();
-    apply_configuration(state)?;
     enable_raw_mode().context("Failed to enable raw terminal mode")?;
     execute!(io::stdout(), cursor::Hide)?;
     render_ui(&state)?;
@@ -167,77 +209,40 @@ fn main() -> Result<()> {
     result
 }
 
-fn load_configuration() -> Result<HashMap<String,String>> {
-    let settings = Config::builder()
+fn load_configuration() -> Result<AppConfig> {
+    let cfg = Config::builder()
         .add_source(config::File::with_name("config"))
-        .add_source(config::Environment::with_prefix("APP"))
+        .add_source(config::Environment::with_prefix("ROBOCONTROL"))
         .build()    
             .map_err(|e| anyhow::anyhow!("config error: {:?}", e));
 
-        return settings    
-            .try_deserialize::<HashMap<String, String>>();
-
+    let raw: RawConfig = cfg.try_deserialize()?;
+    return AppConfig::from_raw(raw)?;
 }
 
-fn apply_configuration(state: &mut RoboState, cfg: HashMap<String, String>) {
-    for c in NUMBER_OF_CHANNELS {
-        if c == 0 {
-            state.channels[c] = Channel::C0;
-        }
-        else if c == 1 {
-            state.channels[c] = Channel::C1;
-        }
-        else if c == 2 {
-            state.channels[c] = Channel::C2;
-        }
-        else if c == 3 {
-            state.channels[c] = Channel::C3;
-        }
-        else if c == 4 {
-            state.channels[c] = Channel::C4;
-        }
-        else if c == 5 {
-            state.channels[c] = Channel::C5;
-        }
-        else if c == 6 {
-            state.channels[c] = Channel::C6;
-        }
-        else if c == 7 {
-            state.channels[c] = Channel::C7;
-        }
-        else if c == 8 {
-            state.channels[c] = Channel::C8;
-        }
-        else if c == 9 {
-            state.channels[c] = Channel::C9;
-        }
-        else if c == 10 {
-            state.channels[c] = Channel::C10;
-        }
-        else if c == 11 {
-            state.channels[c] = Channel::C11;
-        }
-        else if c == 12 {
-            state.channels[c] = Channel::C12;
-        }
-        else if c == 13 {
-            state.channels[c] = Channel::C13;
-        }
-        else if c == 14 {
-            state.channels[c] = Channel::C14;
-        }
-        else if c == 15 {
-            state.channels[c] = Channel::C15;
-        } else {
-            // TODO: return an error here saying more than 16 channels is unsupported
-        }
+fn channel_from_u8(n: u8) -> Option<Channel> {
+    match n {
+        0  => Some(Channel::C0),
+        1  => Some(Channel::C1),
+        2  => Some(Channel::C2),
+        3  => Some(Channel::C3),
+        4  => Some(Channel::C4),
+        5  => Some(Channel::C5),
+        6  => Some(Channel::C6),
+        7  => Some(Channel::C7),
+        8  => Some(Channel::C8),
+        9  => Some(Channel::C9),
+        10 => Some(Channel::C10),
+        11 => Some(Channel::C11),
+        12 => Some(Channel::C12),
+        13 => Some(Channel::C13),
+        14 => Some(Channel::C14),
+        15 => Some(Channel::C15),
+        _  => None,
     }
-
-    
 }
 
-
-fn run_loop(driver: &mut PwmDriver, state: &mut RoboState) -> Result<()> {
+fn run_loop(driver: &mut PwmDriver, state: &mut AppConfig) -> Result<()> {
     loop {
         if event::poll(Duration::from_millis(50))? {
             if let Event::Key(key) = event::read()? {
