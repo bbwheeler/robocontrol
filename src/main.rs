@@ -3,6 +3,7 @@
 use std::io;
 use std::time::Duration;
 use std::thread;
+use std::cmp;
 
 use anyhow::{Context, Result};
 use crossterm::{
@@ -18,6 +19,15 @@ use config::Config;
 use serde::Deserialize;
 
 const NUMBER_OF_CHANNELS: usize = 16;
+
+enum Adjustment {
+    INCREASE,
+    DECREASE,
+    MAX,
+    MIN,
+    NEUTRAL,
+}
+
 
 #[derive(Debug, Deserialize)]
 struct I2cConfig {
@@ -55,7 +65,8 @@ struct RawConfig {
     neutral: u16,
     step: u16,
     mavlink_channel: u8,
-    current_value: u16
+    current_value: u16,
+    changed: bool,
 }
 
 struct AppConfig {
@@ -76,6 +87,22 @@ impl AppConfig {
 
         let channels: [Option<ChannelConfig>; 16] = convert(raw.channel)?;
         Ok(Self { i2c: raw.i2c, pwm: raw.pwm, channel: channels })
+    }
+
+    fn adjust(&mut self, chan: usize, adjustment: Adjustment) {
+        match self.channel[chan] {
+            Some(mut ch) => {
+                match adjustment {
+                    Adjustment::INCREASE => ch.current_value = cmp::min(ch.current_value + ch.step, ch.max),
+                    Adjustment::DECREASE => ch.current_value = cmp::max(ch.current_value - ch.step, ch.min),
+                    Adjustment::MAX => ch.current_value = ch.max,
+                    Adjustment::MIN => ch.current_value = ch.min,
+                    Adjustment::NEUTRAL => ch.current_value = ch.neutral,
+                }
+                ch.changed = true
+            },
+            None => (),
+        };
     }
 }
 
@@ -105,6 +132,7 @@ impl TryFrom<RawChannelConfig> for ChannelConfig {
             step: raw.step,
             mavlink_channel: raw.mavlink_channel,
             current_value: raw.neutral,
+            changed: true,
         })
     }
 }
@@ -122,6 +150,7 @@ impl TryFrom<&RawChannelConfig> for ChannelConfig {
             step: raw.step,
             mavlink_channel: raw.mavlink_channel,
             current_value: raw.neutral,
+            changed: true,
         })
     }
 }
@@ -173,20 +202,24 @@ impl PwmDriver {
     fn apply(&mut self, state: &AppConfig) -> Result<()> {
         for c in 0..NUMBER_OF_CHANNELS {
             match state.channel[c] {
-                Some(ch) => self.set_pulse(ch.pwm_channel, ch.current_value)?,
+                Some(mut ch) => {
+                    self.set_pulse(ch.pwm_channel, ch.current_value)?;
+                    ch.changed = false;
+                } 
                 None => (),
             }
         } 
         Ok(())
     }
 
-    fn safe_stop(&mut self, state: &AppConfig) {
+    fn safe_stop(&mut self, state: &AppConfig) -> Result<()> {
         for c in 0..NUMBER_OF_CHANNELS {
             match state.channel[c] {
-                Some(ch) => self.set_pulse(ch.pwm_channel, ch.neutral),
-                None => Ok(()),
+                Some(ch) => self.set_pulse(ch.pwm_channel, ch.neutral)?,
+                None => (),
             };
         }
+        Ok(())
     }
 }
 
@@ -238,7 +271,7 @@ fn arm_esc(driver: &mut PwmDriver, state: &AppConfig) -> Result<()> {
 fn main() -> Result<()> {
     env_logger::init();
 
-    let state = load_configuration()?;
+    let mut state = load_configuration()?;
 
     let mut driver = PwmDriver::new(&state.i2c.path, state.i2c.address, state.pwm.prescale).context("Failed to initialise PCA9685")?;
     arm_esc(&mut driver, &state)?;
@@ -248,7 +281,7 @@ fn main() -> Result<()> {
     let result = run_loop(&mut driver, &mut state);
     let _ = disable_raw_mode();
     let _ = execute!(io::stdout(), cursor::Show);
-    driver.safe_stop(&state);
+    driver.safe_stop(&state)?;
     println!("\nRC robo controller stopped. Goodbye!");
     result
 }
@@ -293,10 +326,10 @@ fn run_loop(driver: &mut PwmDriver, state: &mut AppConfig) -> Result<()> {
                 if key.kind == KeyEventKind::Press {
                     match key.code {
                         KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc   => break,
-                        KeyCode::Char('w') | KeyCode::Char('W') | KeyCode::Up    => state.apply_throttle_forward(),
-                        KeyCode::Char('s') | KeyCode::Char('S') | KeyCode::Down  => state.apply_throttle_reverse(),
-                        KeyCode::Char('a') | KeyCode::Char('A') | KeyCode::Left  => state.steer_left(),
-                        KeyCode::Char('d') | KeyCode::Char('D') | KeyCode::Right => state.steer_right(),
+                        KeyCode::Char('w') | KeyCode::Char('W') | KeyCode::Up    => state.adjust(1, Adjustment::INCREASE),
+                        KeyCode::Char('s') | KeyCode::Char('S') | KeyCode::Down  => state.adjust(1, Adjustment::DECREASE),
+                        KeyCode::Char('a') | KeyCode::Char('A') | KeyCode::Left  => state.adjust(0, Adjustment::DECREASE),
+                        KeyCode::Char('d') | KeyCode::Char('D') | KeyCode::Right => state.adjust(0,Adjustment::INCREASE),
                         _                                                        => continue,
                     }
                     driver.apply(state)?;
