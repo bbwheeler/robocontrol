@@ -90,8 +90,8 @@ impl AppConfig {
     }
 
     fn adjust(&mut self, chan: usize, adjustment: Adjustment) {
-        match self.channel[chan] {
-            Some(mut ch) => {
+        match &mut self.channel[chan] {
+            Some(ch) => {
                 match adjustment {
                     Adjustment::INCREASE => ch.current_value = cmp::min(ch.current_value + ch.step, ch.max),
                     Adjustment::DECREASE => ch.current_value = cmp::max(ch.current_value - ch.step, ch.min),
@@ -106,8 +106,8 @@ impl AppConfig {
     }
 }
 
-fn convert(configVector: Vec<RawChannelConfig>) -> Result<[Option<ChannelConfig>; NUMBER_OF_CHANNELS]> {
-        let raw_iter = configVector.iter();
+fn convert(config_vector: Vec<RawChannelConfig>) -> Result<[Option<ChannelConfig>; NUMBER_OF_CHANNELS]> {
+        let raw_iter = config_vector.iter();
 
         let mut result: [Option<ChannelConfig>; NUMBER_OF_CHANNELS] = [None; NUMBER_OF_CHANNELS];
 
@@ -199,10 +199,10 @@ impl PwmDriver {
             .map_err(|e| anyhow::anyhow!("set_channel_on_off error: {:?}", e))
     }
 
-    fn apply(&mut self, state: &AppConfig) -> Result<()> {
+    fn apply(&mut self, state: &mut AppConfig) -> Result<()> {
         for c in 0..NUMBER_OF_CHANNELS {
-            match state.channel[c] {
-                Some(mut ch) => {
+            match &mut state.channel[c] {
+                Some(ch) => {
                     self.set_pulse(ch.pwm_channel, ch.current_value)?;
                     ch.changed = false;
                 } 
@@ -330,6 +330,10 @@ fn run_loop(driver: &mut PwmDriver, state: &mut AppConfig) -> Result<()> {
                         KeyCode::Char('s') | KeyCode::Char('S') | KeyCode::Down  => state.adjust(1, Adjustment::DECREASE),
                         KeyCode::Char('a') | KeyCode::Char('A') | KeyCode::Left  => state.adjust(0, Adjustment::DECREASE),
                         KeyCode::Char('d') | KeyCode::Char('D') | KeyCode::Right => state.adjust(0,Adjustment::INCREASE),
+                        KeyCode::Char('t') | KeyCode::Char('T') => state.adjust(1,Adjustment::MAX),
+                        KeyCode::Char('g') | KeyCode::Char('G') => state.adjust(1,Adjustment::NEUTRAL),
+                        KeyCode::Char('b') | KeyCode::Char('B') => state.adjust(1,Adjustment::MIN),
+
                         _                                                        => continue,
                     }
                     driver.apply(state)?;
