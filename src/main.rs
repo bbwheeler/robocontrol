@@ -27,7 +27,7 @@ struct I2cConfig {
 
 #[derive(Debug, Deserialize)]
 struct PwmConfig {
-    prescale: u32,
+    prescale: u8,
 }
 
 #[derive(Debug, Deserialize)]
@@ -47,7 +47,8 @@ struct RawConfig {
     channel: Vec<RawChannelConfig>,
 }
 
-struct ChannelConfig {
+ #[derive(Copy, Clone)]
+ struct ChannelConfig {
     pwm_channel: Channel,
     min: u16,
     max: u16,
@@ -60,19 +61,36 @@ struct ChannelConfig {
 struct AppConfig {
     i2c: I2cConfig,
     pwm: PwmConfig,
-    channel: [ChannelConfig; NUMBER_OF_CHANNELS],
+    channel: [Option<ChannelConfig>; NUMBER_OF_CHANNELS],
 }
 
 impl AppConfig {
-    fn from_raw(raw: RawConfig) -> Result<Self> {
-        while raw.channel.len() < NUMBER_OF_CHANNELS {
-            raw.channel.push(nil);
+    fn from_raw(raw: RawConfig) -> Result<Self> {        
+        let mut channels: [Option<ChannelConfig>; NUMBER_OF_CHANNELS] = std::array::from_fn(|_| None);
+        for (i, ch) in raw.channel.iter().enumerate() {
+            if i < NUMBER_OF_CHANNELS {
+                channels[i] = Some(ch.try_into().expect("invalid pwm channel"));
+            }
         }
-        
-        let channels: [ChannelConfig; 16] = raw.channel.try_into()?;
+
+
+        let channels: [Option<ChannelConfig>; 16] = convert(raw.channel)?;
         Ok(Self { i2c: raw.i2c, pwm: raw.pwm, channel: channels })
     }
 }
+
+fn convert(configVector: Vec<RawChannelConfig>) -> Result<[Option<ChannelConfig>; NUMBER_OF_CHANNELS]> {
+        let raw_iter = configVector.iter();
+
+        let mut result: [Option<ChannelConfig>; NUMBER_OF_CHANNELS] = [None; NUMBER_OF_CHANNELS];
+
+        for (i, val) in raw_iter.enumerate() {
+            result[i] = Some(val.try_into().expect("sad."));
+        }
+
+        Ok(result)
+}
+
 
 impl TryFrom<RawChannelConfig> for ChannelConfig {
     type Error = String;
@@ -90,6 +108,25 @@ impl TryFrom<RawChannelConfig> for ChannelConfig {
         })
     }
 }
+
+impl TryFrom<&RawChannelConfig> for ChannelConfig {
+    type Error = String;
+
+    fn try_from(raw: &RawChannelConfig) -> Result<Self, Self::Error> {
+        Ok(Self {
+            pwm_channel: channel_from_u8(raw.pwm_channel)
+                .ok_or(format!("Invalid pwm_channel: {}", raw.pwm_channel))?,
+            min: raw.min,
+            max: raw.max,
+            neutral: raw.neutral,
+            step: raw.step,
+            mavlink_channel: raw.mavlink_channel,
+            current_value: raw.neutral,
+        })
+    }
+}
+
+
 
 // impl RoboState {
 //     fn new() -> Self {
@@ -135,21 +172,22 @@ impl PwmDriver {
 
     fn apply(&mut self, state: &AppConfig) -> Result<()> {
         for c in 0..NUMBER_OF_CHANNELS {
-            self.set_pulse(state.channel[c].pwm_channel, state.channel[c].current_value)?;
-
+            match state.channel[c] {
+                Some(ch) => self.set_pulse(ch.pwm_channel, ch.current_value)?,
+                None => (),
+            }
         } 
         Ok(())
     }
 
     fn safe_stop(&mut self, state: &AppConfig) {
         for c in 0..NUMBER_OF_CHANNELS {
-            self.set_pulse(state.channel[c].pwm_channel, state.channel[c].neutral)?;
-        } 
+            match state.channel[c] {
+                Some(ch) => self.set_pulse(ch.pwm_channel, ch.neutral),
+                None => Ok(()),
+            };
+        }
     }
-}
-
-impl Drop for PwmDriver {
-    fn drop(&mut self) { self.safe_stop(); }
 }
 
 fn render_ui(state: &AppConfig) -> Result<()> {
@@ -173,7 +211,10 @@ fn render_ui(state: &AppConfig) -> Result<()> {
     println!("");
     println!("** Current **");
     for c in 0..NUMBER_OF_CHANNELS {
-        println!("Channel {}: {}", c, state.channel[c].current_value);
+            match state.channel[c] {
+                Some(ch) => println!("Channel {}: {}", c, ch.current_value),
+                None => (),
+            };
     } 
     stdout.flush()?;
     Ok(())
@@ -183,7 +224,10 @@ fn arm_esc(driver: &mut PwmDriver, state: &AppConfig) -> Result<()> {
     println!("Arming ESC — sending neutral for 2 s…");
 
     for c in 0..NUMBER_OF_CHANNELS {
-        driver.set_pulse(c, state.channel[c].neutral)?;
+            match state.channel[c] {
+                Some(ch) => driver.set_pulse(ch.pwm_channel, ch.neutral)?,
+                None => (),
+            };
     } 
     thread::sleep(Duration::from_secs(2));
     println!("ESCs armed.");
@@ -196,15 +240,15 @@ fn main() -> Result<()> {
 
     let state = load_configuration()?;
 
-    let mut driver = PwmDriver::new().context("Failed to initialise PCA9685")?;
-    arm_esc(&mut driver)?;
+    let mut driver = PwmDriver::new(&state.i2c.path, state.i2c.address, state.pwm.prescale).context("Failed to initialise PCA9685")?;
+    arm_esc(&mut driver, &state)?;
     enable_raw_mode().context("Failed to enable raw terminal mode")?;
     execute!(io::stdout(), cursor::Hide)?;
     render_ui(&state)?;
     let result = run_loop(&mut driver, &mut state);
     let _ = disable_raw_mode();
     let _ = execute!(io::stdout(), cursor::Show);
-    driver.safe_stop();
+    driver.safe_stop(&state);
     println!("\nRC robo controller stopped. Goodbye!");
     result
 }
@@ -216,8 +260,8 @@ fn load_configuration() -> Result<AppConfig> {
         .build()    
             .map_err(|e| anyhow::anyhow!("config error: {:?}", e));
 
-    let raw: RawConfig = cfg.try_deserialize()?;
-    return AppConfig::from_raw(raw)?;
+    let raw: RawConfig = cfg.expect("whatever").try_deserialize()?;
+    return AppConfig::from_raw(raw);
 }
 
 fn channel_from_u8(n: u8) -> Option<Channel> {
