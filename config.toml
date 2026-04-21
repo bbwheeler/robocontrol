@@ -1,17 +1,23 @@
-[address]
-i2c_address = 64
+[i2c]
+address = 0x40
+path = "/dev/i2c-1"
 
-[units]
+[pwm]
+prescale = 100
 
-    [unit.A]
-    type = "servo"
+[[channel]]
+pwm_channel = 0
+min = 380
+max = 620
+neutral = 500
+step = 20
+mavlink_channel = 1
 
-    [unit.B]
-    type = "esc"
+[[channel]]
+pwm_channel = 1
+min = 200
+max = 600
+step = 20
+neutral = 400
+mavlink_channel = 3
 
-[keys]
-
-left = "a"
-right = "d"
-forward = "w"
-backward = "s"
