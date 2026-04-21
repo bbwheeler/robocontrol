@@ -27,8 +27,6 @@ enum Adjustment {
     MIN,
     NEUTRAL,
 }
-
-
 #[derive(Debug, Deserialize)]
 struct I2cConfig {
     address: u8,
@@ -112,7 +110,7 @@ fn convert(config_vector: Vec<RawChannelConfig>) -> Result<[Option<ChannelConfig
         let mut result: [Option<ChannelConfig>; NUMBER_OF_CHANNELS] = [None; NUMBER_OF_CHANNELS];
 
         for (i, val) in raw_iter.enumerate() {
-            result[i] = Some(val.try_into().expect("sad."));
+            result[i] = Some(val.try_into().expect("channel invalid"));
         }
 
         Ok(result)
@@ -154,26 +152,6 @@ impl TryFrom<&RawChannelConfig> for ChannelConfig {
         })
     }
 }
-
-
-
-// impl RoboState {
-//     fn new() -> Self {
-//         Self {
-//             channel_values: [0; NUMBER_OF_CHANNELS],
-//             channel_max_values: [0; NUMBER_OF_CHANNELS],
-//             channel_min_values: [0; NUMBER_OF_CHANNELS],
-//             channel_steps: [0; NUMBER_OF_CHANNELS],
-//             channel_neutral_values: [0; NUMBER_OF_CHANNELS],
-//             channels: [Channel::All; NUMBER_OF_CHANNELS],
-//         }
-//     }
-//     // fn increase_channel(&mut self, channel)
-//     fn apply_throttle_forward(&mut self) { self.channel_values[1] = (self.channel_values[1] + self.channel_steps[1]).min(self.channel_max_values[1]); }
-//     fn apply_throttle_reverse(&mut self) { self.channel_values[1] = (self.channel_values[1] - self.channel_steps[1]).max(self.channel_min_values[1]); }
-//     fn steer_left(&mut self)             { self.channel_values[0] = (self.channel_values[0] - self.channel_steps[0]).max(self.channel_min_values[0]); }
-//     fn steer_right(&mut self)            { self.channel_values[0] = (self.channel_values[0] + self.channel_steps[0]).min(self.channel_max_values[0]); }
-// }
 
 struct PwmDriver { pca: Pca9685<I2cdev> }
 
