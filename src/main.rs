@@ -15,10 +15,18 @@ use crossterm::{
 use linux_embedded_hal::I2cdev;
 use pwm_pca9685::{Address, Channel, Pca9685};
 use config::Config;
-
+use mavlink::ardupilotmega::MavMessage;
+use mavlink::{MavConnection, MavHeader};
+use std::sync::{Arc, Mutex};
 use serde::Deserialize;
+use std::thread;
+use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicBool, Ordering};
+
 
 const NUMBER_OF_CHANNELS: usize = 16;
+
+const HEARTBEAT_DURATION: Duration = Duration::from_secs(1);
 
 enum Adjustment {
     INCREASE,
@@ -39,6 +47,11 @@ struct PwmConfig {
 }
 
 #[derive(Debug, Deserialize)]
+struct MavlinkConfig {
+    port: u16,
+}
+
+#[derive(Debug, Deserialize)]
 struct RawChannelConfig {
     pwm_channel: u8,
     min: u16,
@@ -52,6 +65,7 @@ struct RawChannelConfig {
 struct RawConfig {
     i2c: I2cConfig,
     pwm: PwmConfig,
+    mav: MavlinkConfig,
     channel: Vec<RawChannelConfig>,
 }
 
@@ -70,6 +84,7 @@ struct RawConfig {
 struct AppConfig {
     i2c: I2cConfig,
     pwm: PwmConfig,
+    mav: MavlinkConfig,
     channel: [Option<ChannelConfig>; NUMBER_OF_CHANNELS],
 }
 
@@ -84,7 +99,7 @@ impl AppConfig {
 
 
         let channels: [Option<ChannelConfig>; 16] = convert(raw.channel)?;
-        Ok(Self { i2c: raw.i2c, pwm: raw.pwm, channel: channels })
+        Ok(Self { i2c: raw.i2c, pwm: raw.pwm, mav: raw.mav, channel: channels })
     }
 
     fn adjust(&mut self, chan: usize, adjustment: Adjustment) {
@@ -153,10 +168,40 @@ impl TryFrom<&RawChannelConfig> for ChannelConfig {
     }
 }
 
+struct MavLinkService {
+    connection: !,
+}
+
+impl MavLinkService {
+    fn new(state: AppConfig) -> Result<Self> {
+        connection = mavlink::connect::<ardupilotmega::MavMessage>(format!("udpin:0.0.0.0:{}", state.mav.port))?;
+        Ok(Self{connection})
+    }
+
+    fn send_heart_beat(&self) -> Result<()> {
+        let heartbeat = ardupilotmega::MavMessage::HEARTBEAT(ardupilotmega::HEARTBEAT_DATA {
+            custom_mode: 0,
+            mavtype: ardupilotmega::MavType::MAV_TYPE_ROVER,
+            autopilot: ardupilotmega::MavAutopilot::MAV_AUTOPILOT_INVALID,
+            base_mode: ardupilotmega::MavModeFlag::empty(),
+            system_status: ardupilotmega::MavState::MAV_STATE_STANDBY,
+            mavlink_version: 3,
+        });
+
+
+        self.connection.send(&mavlink::MavHeader::default(), &heartbeat);
+    }
+
+    fn receive_commands(&self) {
+        et (header, message) = conn.recv()?;
+    }
+
+}
+
 struct PwmDriver { pca: Pca9685<I2cdev> }
 
 impl PwmDriver {
-    fn new(ic2_bus_path: &str, ic2_address: u8, prescale: u8) -> Result<Self> {
+    fn new(ic2_bus_path: &str, ic2_address: u8, prescale: u8) -> Result<Self> {    
         let i2c = I2cdev::new(ic2_bus_path)
             .with_context(|| format!("Failed to open I2C bus '{ic2_bus_path}'"))?;
         let address = Address::from(ic2_address);
@@ -297,8 +342,16 @@ fn channel_from_u8(n: u8) -> Option<Channel> {
     }
 }
 
-fn run_loop(driver: &mut PwmDriver, state: &mut AppConfig) -> Result<()> {
+fn heartbeat(mavlinkService: MavLinkService) {
+}
+
+fn run_loop(driver: &mut PwmDriver, state: &mut AppConfig, mavLinkService: MavLinkService) -> Result<()> {
+    let mut time_since_last_heartbeat = Instant::now();
     loop {
+        if time_since_last_heartbeat.elapsed() > HEARTBEAT_DURATION {
+            mavLinkService.send_heart_beat()?;
+            time_since_last_heartbeat = Instant::now();
+        }
         if event::poll(Duration::from_millis(50))? {
             if let Event::Key(key) = event::read()? {
                 if key.kind == KeyEventKind::Press {
@@ -311,7 +364,6 @@ fn run_loop(driver: &mut PwmDriver, state: &mut AppConfig) -> Result<()> {
                         KeyCode::Char('t') | KeyCode::Char('T') => state.adjust(1,Adjustment::MAX),
                         KeyCode::Char('g') | KeyCode::Char('G') => state.adjust(1,Adjustment::NEUTRAL),
                         KeyCode::Char('b') | KeyCode::Char('B') => state.adjust(1,Adjustment::MIN),
-
                         _                                                        => continue,
                     }
                     driver.apply(state)?;
