@@ -169,7 +169,7 @@ impl TryFrom<&RawChannelConfig> for ChannelConfig {
 }
 
 struct MavLinkService {
-    connection: !,
+    connection: MavConnection,
 }
 
 impl MavLinkService {
@@ -185,7 +185,7 @@ impl MavLinkService {
             autopilot: ardupilotmega::MavAutopilot::MAV_AUTOPILOT_INVALID,
             base_mode: ardupilotmega::MavModeFlag::empty(),
             system_status: ardupilotmega::MavState::MAV_STATE_STANDBY,
-            mavlink_version: 3,
+            mavlink_version: 0x3,
         });
 
 
@@ -342,9 +342,6 @@ fn channel_from_u8(n: u8) -> Option<Channel> {
     }
 }
 
-fn heartbeat(mavlinkService: MavLinkService) {
-}
-
 fn run_loop(driver: &mut PwmDriver, state: &mut AppConfig, mavLinkService: MavLinkService) -> Result<()> {
     let mut time_since_last_heartbeat = Instant::now();
     loop {
@@ -352,25 +349,29 @@ fn run_loop(driver: &mut PwmDriver, state: &mut AppConfig, mavLinkService: MavLi
             mavLinkService.send_heart_beat()?;
             time_since_last_heartbeat = Instant::now();
         }
-        if event::poll(Duration::from_millis(50))? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind == KeyEventKind::Press {
-                    match key.code {
-                        KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc   => break,
-                        KeyCode::Char('w') | KeyCode::Char('W') | KeyCode::Up    => state.adjust(1, Adjustment::INCREASE),
-                        KeyCode::Char('s') | KeyCode::Char('S') | KeyCode::Down  => state.adjust(1, Adjustment::DECREASE),
-                        KeyCode::Char('a') | KeyCode::Char('A') | KeyCode::Left  => state.adjust(0, Adjustment::DECREASE),
-                        KeyCode::Char('d') | KeyCode::Char('D') | KeyCode::Right => state.adjust(0,Adjustment::INCREASE),
-                        KeyCode::Char('t') | KeyCode::Char('T') => state.adjust(1,Adjustment::MAX),
-                        KeyCode::Char('g') | KeyCode::Char('G') => state.adjust(1,Adjustment::NEUTRAL),
-                        KeyCode::Char('b') | KeyCode::Char('B') => state.adjust(1,Adjustment::MIN),
-                        _                                                        => continue,
-                    }
-                    driver.apply(state)?;
-                    render_ui(state)?;
+
+        match con.recv() {
+            Ok((_header, msg)) => {
+                let (ch: Channel, a: Adjustment) = translateMessage(msg, state); 
+
+
+                driver.apply(state)?;
+                render_ui(state)?;
+            }
+            Err(MessageReadError::Io(e)) => {
+                if e.kind() == std::io::ErrorKind::WouldBlock {
+                    // no messages currently available to receive -- wait a bit
+                    thread::sleep(Duration::from_millis(50));
+                    continue;
+                } else {
+                    println!("recv error: {e:?}");
+                    break;
                 }
             }
+            // messages that didn't get through due to parser errors are ignored
+            _ => {}
         }
     }
+
     Ok(())
 }
