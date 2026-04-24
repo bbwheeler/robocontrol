@@ -8,6 +8,10 @@ prescale = 100
 [mav]
 port = 14550
 
+[controls]
+steering = 0
+throttle = 1
+
 # Steering
 [[channel]]
 pwm_channel = 0
