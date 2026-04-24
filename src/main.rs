@@ -182,14 +182,14 @@ struct MavLinkService {
 
 impl MavLinkService {
     fn new(state: AppConfig) -> Result<Self> {
-        let connection = mavlink::connect::<MavMessage>(format!("udpin:0.0.0.0:{}", state.mav.port))?;
+        let connection = mavlink::connect::<MavMessage>(format!("udpin:0.0.0.0:{}", state.mav.port).as_str())?;
         Ok(Self{connection})
     }
 
     fn send_heart_beat(&self) -> Result<()> {
         let heartbeat = MavMessage::HEARTBEAT(mavlink::ardupilotmega::HEARTBEAT_DATA {
             custom_mode: 0,
-            mavtype: mavlink::ardupilotmega::MavType::MAV_TYPE_ROVER,
+            mavtype: mavlink::ardupilotmega::MavType::MAV_TYPE_GROUND_ROVER,
             autopilot: mavlink::ardupilotmega::MavAutopilot::MAV_AUTOPILOT_INVALID,
             base_mode: mavlink::ardupilotmega::MavModeFlag::empty(),
             system_status: mavlink::ardupilotmega::MavState::MAV_STATE_STANDBY,
@@ -197,7 +197,8 @@ impl MavLinkService {
         });
 
 
-        self.connection.send(&mavlink::MavHeader::default(), &heartbeat);
+        self.connection.send(&mavlink::MavHeader::default(), &heartbeat)?;
+        Ok(())
     }
 }
 
@@ -300,11 +301,14 @@ fn main() -> Result<()> {
     let mut state = load_configuration()?;
 
     let mut driver = PwmDriver::new(&state.i2c.path, state.i2c.address, state.pwm.prescale).context("Failed to initialise PCA9685")?;
+
+    let mav : MavLinkService = MavLinkService::new(state)?;
+
     arm_esc(&mut driver, &state)?;
     enable_raw_mode().context("Failed to enable raw terminal mode")?;
     execute!(io::stdout(), cursor::Hide)?;
     render_ui(&state)?;
-    let result = run_loop(&mut driver, &mut state);
+    let result = run_loop(&mut driver, &mut state, mav);
     let _ = disable_raw_mode();
     let _ = execute!(io::stdout(), cursor::Show);
     driver.safe_stop(&state)?;
@@ -349,28 +353,40 @@ fn mavlink_to_pwm(input: u16, channel_config: ChannelConfig) -> u16 {
     if input == 0 {
         return channel_config.neutral;
     } else if input > 0 {
-        return  input / 1000.0 * (channel_config.max - channel_config.neutral) + channel_config.neutral
+        return  (input as f32 / 1000.0 * ((channel_config.max - channel_config.neutral) + channel_config.neutral) as f32).round() as u16
     } else {
-        return abs(input)/1000.0 * (channel_config.neutral - channel_config.min) + channel_config.min
+        return (input as f32/1000.0 * -1.0 * ((channel_config.neutral - channel_config.min) + channel_config.min) as f32).round() as u16
     }
-    return channel_config.neutral;
 }
 
 fn translate_message(msg :MavMessage, state: &AppConfig) -> Vec<AbsoluteControlOutput> {
     let mut outputs: Vec<AbsoluteControlOutput> = Vec::new();
+    
+    let mut throttle_channel_config: ChannelConfig = ChannelConfig { pwm_channel: Channel::C0, min: 0, max: 0, neutral: 0, step: 0, mavlink_channel: 0, current_value: 0, changed: false };
+    match state.channel[state.controls.throttle as usize] {
+        Some(chan) => throttle_channel_config = chan,
+        None => (),
+    }
+
+    let mut steering_channel_config: ChannelConfig = ChannelConfig { pwm_channel: Channel::C0, min: 0, max: 0, neutral: 0, step: 0, mavlink_channel: 0, current_value: 0, changed: false };
+    match state.channel[state.controls.steering as usize] {
+        Some(chan) => steering_channel_config = chan,
+        None => (),
+    }
+    
     match msg {
         MavMessage::MANUAL_CONTROL(data) => {
-            let throttle = mavlink_to_pwm(data.x, state.channel[state.controls.throttle]);
+            let throttle = mavlink_to_pwm(data.x as u16, throttle_channel_config);
             outputs.push(AbsoluteControlOutput{
-                channel: channel_from_u8(state.controls.throttle),
+                channel: channel_from_u8(state.controls.throttle).expect("unsupported channel"),
                 value: throttle,
             });
 
             // Steering can be roll or yaw
             let steering = if data.y != 0 {
-                mavlink_to_pwm(data.y, state.channel[state.controls.steering])
+                mavlink_to_pwm(data.y as u16, steering_channel_config)
             } else {
-                mavlink_to_pwm(data.r, state.channel[state.controls.steering])
+                mavlink_to_pwm(data.r as u16, steering_channel_config)
             };
 
             outputs.push(AbsoluteControlOutput{
@@ -390,9 +406,16 @@ fn translate_message(msg :MavMessage, state: &AppConfig) -> Vec<AbsoluteControlO
             ];
 
             for i in cmp::min(NUMBER_OF_CHANNELS, channels.len()) {
+
+                let mut channel_config: ChannelConfig = ChannelConfig { pwm_channel: Channel::C0, min: 0, max: 0, neutral: 0, step: 0, mavlink_channel: 0, current_value: 0, changed: false };
+                match state.channel[i] {
+                    Some(chan) => channel_config = chan,
+                    None => (),
+                }
+
                 outputs.push(AbsoluteControlOutput{
                     channel: channel_from_u8(i),
-                    value: mavlink_to_pwm(channels[i], state.channel[i]),
+                    value: mavlink_to_pwm(channels[i], channel_config),
                 });
             }
         }
@@ -414,7 +437,7 @@ fn translate_message(msg :MavMessage, state: &AppConfig) -> Vec<AbsoluteControlO
         }
  
         // Ignore other messages
-        _ => {},
+        _ => (),
     }
 
     return outputs;
