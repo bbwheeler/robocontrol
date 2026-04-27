@@ -181,7 +181,7 @@ struct MavLinkService {
 }
 
 impl MavLinkService {
-    fn new(state: AppConfig) -> Result<Self> {
+    fn new(state: &AppConfig) -> Result<Self> {
         let connection = mavlink::connect::<MavMessage>(format!("udpin:0.0.0.0:{}", state.mav.port).as_str())?;
         Ok(Self{connection})
     }
@@ -302,7 +302,7 @@ fn main() -> Result<()> {
 
     let mut driver = PwmDriver::new(&state.i2c.path, state.i2c.address, state.pwm.prescale).context("Failed to initialise PCA9685")?;
 
-    let mav : MavLinkService = MavLinkService::new(state)?;
+    let mav : MavLinkService = MavLinkService::new(&state)?;
 
     arm_esc(&mut driver, &state)?;
     enable_raw_mode().context("Failed to enable raw terminal mode")?;
@@ -389,23 +389,26 @@ fn translate_message(msg :MavMessage, state: &AppConfig) -> Vec<AbsoluteControlO
                 mavlink_to_pwm(data.r as u16, steering_channel_config)
             };
 
-            outputs.push(AbsoluteControlOutput{
-                channel: channel_from_u8(state.controls.steering),
-                value: steering,
-            }) 
+            match channel_from_u8(state.controls.steering) {
+                Some(chan) => {
+                    outputs.push(AbsoluteControlOutput{
+                        channel: chan,
+                        value: steering,
+                    }) 
+                },
+                None => (),
+            }
+
         }
  
         MavMessage::RC_CHANNELS_OVERRIDE(data) => {
             // 18 available channels.
-            let channels: [u16; 18] = [
+            let channels: [u16; 8] = [
                 data.chan1_raw, data.chan2_raw, data.chan3_raw, data.chan4_raw,
                 data.chan5_raw, data.chan6_raw, data.chan7_raw, data.chan8_raw,
-                data.chan9_raw,  data.chan10_raw, data.chan11_raw, data.chan12_raw,
-                data.chan13_raw, data.chan14_raw, data.chan15_raw, data.chan16_raw,
-                data.chan17_raw, data.chan18_raw,
             ];
 
-            for i in cmp::min(NUMBER_OF_CHANNELS, channels.len()) {
+            for i in 0..cmp::min(NUMBER_OF_CHANNELS, channels.len()) {
 
                 let mut channel_config: ChannelConfig = ChannelConfig { pwm_channel: Channel::C0, min: 0, max: 0, neutral: 0, step: 0, mavlink_channel: 0, current_value: 0, changed: false };
                 match state.channel[i] {
@@ -413,26 +416,52 @@ fn translate_message(msg :MavMessage, state: &AppConfig) -> Vec<AbsoluteControlO
                     None => (),
                 }
 
-                outputs.push(AbsoluteControlOutput{
-                    channel: channel_from_u8(i),
-                    value: mavlink_to_pwm(channels[i], channel_config),
-                });
+                match channel_from_u8(i as u8) {
+                    Some(chan) => {
+                        outputs.push(AbsoluteControlOutput{
+                            channel: chan,
+                            value: mavlink_to_pwm(channels[i], channel_config),
+                        });
+                    },
+                    None => (),
+                }
+
             }
         }
  
         MavMessage::SET_ACTUATOR_CONTROL_TARGET(data) => {
             // Only handle group 0 (primary flight control group).
             if data.group_mlx == 0 {
-                outputs.push(AbsoluteControlOutput{
-                    channel: channel_from_u8(state.controls.throttle),
-                    value: mavlink_to_pwm(data.controls[3] as f32 * 1000, state.channel[state.controls.throttle]),
-                });
-                let throttle = (data.controls[3] as f32).clamp(-1.0, 1.0);
+                match channel_from_u8(state.controls.throttle) {
+                    Some(chan) => {
+                        match state.channel[state.controls.throttle as usize] {
+                            Some(c) => {
+                                outputs.push(AbsoluteControlOutput{
+                                    channel: chan,
+                                    value: mavlink_to_pwm((data.controls[3] * 1000.0) as u16, c),
+                                });
+                            },
+                            None => (),
+                        }
+                    },
+                    None => (),
+                }
 
-                outputs.push(AbsoluteControlOutput{
-                    channel: channel_from_u8(state.controls.steering),
-                    value: mavlink_to_pwm(data.controls[0] as f32 * 1000, state.channel[state.controls.steering]),
-                });                
+                match channel_from_u8(state.controls.steering) {
+                    Some(chan) => {
+                        match state.channel[state.controls.steering as usize] {
+                            Some(c) => {
+                                outputs.push(AbsoluteControlOutput{
+                                    channel: chan,
+                                    value: mavlink_to_pwm((data.controls[0] * 1000.0) as u16, c),
+                                });                
+                            },
+                            None => (),
+                        }
+
+                    },
+                    None => (),
+                }
             }
         }
  
