@@ -23,13 +23,6 @@ const NUMBER_OF_CHANNELS: usize = 16;
 
 const HEARTBEAT_DURATION: Duration = Duration::from_secs(1);
 
-enum Adjustment {
-    INCREASE,
-    DECREASE,
-    MAX,
-    MIN,
-    NEUTRAL,
-}
 #[derive(Debug, Deserialize)]
 struct I2cConfig {
     address: u8,
@@ -52,7 +45,6 @@ struct RawChannelConfig {
     min: u16,
     max: u16,
     neutral: u16,
-    step: u16,
     mavlink_channel: u8,
 }
 
@@ -71,7 +63,6 @@ struct RawConfig {
     min: u16,
     max: u16,
     neutral: u16,
-    step: u16,
     mavlink_channel: u8,
     current_value: u16,
     changed: bool,
@@ -109,22 +100,6 @@ impl AppConfig {
         let channels: [Option<ChannelConfig>; 16] = convert(raw.channel)?;
         Ok(Self { i2c: raw.i2c, pwm: raw.pwm, mav: raw.mav, channel: channels, controls: raw.controls, })
     }
-
-    fn adjust(&mut self, chan: usize, adjustment: Adjustment) {
-        match &mut self.channel[chan] {
-            Some(ch) => {
-                match adjustment {
-                    Adjustment::INCREASE => ch.current_value = cmp::min(ch.current_value + ch.step, ch.max),
-                    Adjustment::DECREASE => ch.current_value = cmp::max(ch.current_value - ch.step, ch.min),
-                    Adjustment::MAX => ch.current_value = ch.max,
-                    Adjustment::MIN => ch.current_value = ch.min,
-                    Adjustment::NEUTRAL => ch.current_value = ch.neutral,
-                }
-                ch.changed = true
-            },
-            None => (),
-        };
-    }
 }
 
 fn convert(config_vector: Vec<RawChannelConfig>) -> Result<[Option<ChannelConfig>; NUMBER_OF_CHANNELS]> {
@@ -150,7 +125,6 @@ impl TryFrom<RawChannelConfig> for ChannelConfig {
             min: raw.min,
             max: raw.max,
             neutral: raw.neutral,
-            step: raw.step,
             mavlink_channel: raw.mavlink_channel,
             current_value: raw.neutral,
             changed: true,
@@ -168,7 +142,6 @@ impl TryFrom<&RawChannelConfig> for ChannelConfig {
             min: raw.min,
             max: raw.max,
             neutral: raw.neutral,
-            step: raw.step,
             mavlink_channel: raw.mavlink_channel,
             current_value: raw.neutral,
             changed: true,
@@ -349,7 +322,29 @@ fn channel_from_u8(n: u8) -> Option<Channel> {
     }
 }
 
-fn mavlink_to_pwm(input: u16, channel_config: ChannelConfig) -> u16 {
+fn u8_from_channel(c: Channel) -> u8 {
+    match c {
+        Channel::C0 => 0,
+        Channel::C1 => 1,
+        Channel::C2 => 2,
+        Channel::C3 => 3,
+        Channel::C4 => 4,
+        Channel::C5 => 5,
+        Channel::C6 => 6,
+        Channel::C7 => 7,
+        Channel::C8 => 8,
+        Channel::C9 => 9,
+        Channel::C10 => 10,
+        Channel::C11 => 11,
+        Channel::C12 => 12,
+        Channel::C13 => 13,
+        Channel::C14 => 14,
+        Channel::C15 => 15,
+        Channel::All => 0, // ...
+    }
+}
+
+fn mavlink_to_pwm(input: u16, channel_config: &ChannelConfig) -> u16 {
     if input == 0 {
         return channel_config.neutral;
     } else if input > 0 {
@@ -362,13 +357,13 @@ fn mavlink_to_pwm(input: u16, channel_config: ChannelConfig) -> u16 {
 fn translate_message(msg :MavMessage, state: &AppConfig) -> Vec<AbsoluteControlOutput> {
     let mut outputs: Vec<AbsoluteControlOutput> = Vec::new();
     
-    let mut throttle_channel_config: ChannelConfig = ChannelConfig { pwm_channel: Channel::C0, min: 0, max: 0, neutral: 0, step: 0, mavlink_channel: 0, current_value: 0, changed: false };
+    let mut throttle_channel_config: ChannelConfig = ChannelConfig { pwm_channel: Channel::C0, min: 0, max: 0, neutral: 0, mavlink_channel: 0, current_value: 0, changed: false };
     match state.channel[state.controls.throttle as usize] {
         Some(chan) => throttle_channel_config = chan,
         None => (),
     }
 
-    let mut steering_channel_config: ChannelConfig = ChannelConfig { pwm_channel: Channel::C0, min: 0, max: 0, neutral: 0, step: 0, mavlink_channel: 0, current_value: 0, changed: false };
+    let mut steering_channel_config: ChannelConfig = ChannelConfig { pwm_channel: Channel::C0, min: 0, max: 0, neutral: 0, mavlink_channel: 0, current_value: 0, changed: false };
     match state.channel[state.controls.steering as usize] {
         Some(chan) => steering_channel_config = chan,
         None => (),
@@ -376,7 +371,7 @@ fn translate_message(msg :MavMessage, state: &AppConfig) -> Vec<AbsoluteControlO
     
     match msg {
         MavMessage::MANUAL_CONTROL(data) => {
-            let throttle = mavlink_to_pwm(data.x as u16, throttle_channel_config);
+            let throttle = mavlink_to_pwm(data.x as u16, &throttle_channel_config);
             outputs.push(AbsoluteControlOutput{
                 channel: channel_from_u8(state.controls.throttle).expect("unsupported channel"),
                 value: throttle,
@@ -384,9 +379,9 @@ fn translate_message(msg :MavMessage, state: &AppConfig) -> Vec<AbsoluteControlO
 
             // Steering can be roll or yaw
             let steering = if data.y != 0 {
-                mavlink_to_pwm(data.y as u16, steering_channel_config)
+                mavlink_to_pwm(data.y as u16, &steering_channel_config)
             } else {
-                mavlink_to_pwm(data.r as u16, steering_channel_config)
+                mavlink_to_pwm(data.r as u16, &steering_channel_config)
             };
 
             match channel_from_u8(state.controls.steering) {
@@ -408,20 +403,33 @@ fn translate_message(msg :MavMessage, state: &AppConfig) -> Vec<AbsoluteControlO
                 data.chan5_raw, data.chan6_raw, data.chan7_raw, data.chan8_raw,
             ];
 
+            // let dummyChannelConfig: ChannelConfig = ChannelConfig { pwm_channel: Channel::C0, min: 0, max: 0, neutral: 0, mavlink_channel: 0, current_value: 0, changed: false };
+
             for i in 0..cmp::min(NUMBER_OF_CHANNELS, channels.len()) {
 
-                let mut channel_config: ChannelConfig = ChannelConfig { pwm_channel: Channel::C0, min: 0, max: 0, neutral: 0, step: 0, mavlink_channel: 0, current_value: 0, changed: false };
-                match state.channel[i] {
-                    Some(chan) => channel_config = chan,
+
+                let mut channel_config: Option<&ChannelConfig> = None;
+
+                let chan_o_o = state.channel.iter().find(|&cfg| {
+                    match cfg {
+                        Some(c) => c.mavlink_channel as usize == i+1,
+                        None => false,
+                    }
+                });
+
+                match chan_o_o {
+                    Some(chan_o) => {
+                       match chan_o {
+                            Some(c) => channel_config = Some(c),
+                            None => (),
+                       } 
+                    } 
                     None => (),
                 }
 
-                match channel_from_u8(i as u8) {
-                    Some(chan) => {
-                        outputs.push(AbsoluteControlOutput{
-                            channel: chan,
-                            value: mavlink_to_pwm(channels[i], channel_config),
-                        });
+                match channel_config {
+                    Some(cfg) => {
+                        outputs.push(AbsoluteControlOutput { channel: cfg.pwm_channel, value: mavlink_to_pwm(channels[i], cfg) });
                     },
                     None => (),
                 }
@@ -438,7 +446,7 @@ fn translate_message(msg :MavMessage, state: &AppConfig) -> Vec<AbsoluteControlO
                             Some(c) => {
                                 outputs.push(AbsoluteControlOutput{
                                     channel: chan,
-                                    value: mavlink_to_pwm((data.controls[3] * 1000.0) as u16, c),
+                                    value: mavlink_to_pwm((data.controls[3] * 1000.0) as u16, &c),
                                 });
                             },
                             None => (),
@@ -453,7 +461,7 @@ fn translate_message(msg :MavMessage, state: &AppConfig) -> Vec<AbsoluteControlO
                             Some(c) => {
                                 outputs.push(AbsoluteControlOutput{
                                     channel: chan,
-                                    value: mavlink_to_pwm((data.controls[0] * 1000.0) as u16, c),
+                                    value: mavlink_to_pwm((data.controls[0] * 1000.0) as u16, &c),
                                 });                
                             },
                             None => (),
@@ -472,19 +480,27 @@ fn translate_message(msg :MavMessage, state: &AppConfig) -> Vec<AbsoluteControlO
     return outputs;
 }
 
-fn run_loop(driver: &mut PwmDriver, state: &mut AppConfig, mavLinkService: MavLinkService) -> Result<()> {
+fn run_loop(driver: &mut PwmDriver, state: &mut AppConfig, mavlink_service: MavLinkService) -> Result<()> {
     let mut time_since_last_heartbeat = Instant::now();
     loop {
         if time_since_last_heartbeat.elapsed() > HEARTBEAT_DURATION {
-            mavLinkService.send_heart_beat()?;
+            mavlink_service.send_heart_beat()?;
             time_since_last_heartbeat = Instant::now();
         }
 
-        match mavLinkService.connection.recv() {
+        match mavlink_service.connection.recv() {
             Ok((_header, msg)) => {
                 let commands: Vec<AbsoluteControlOutput> = translate_message(msg, state); 
 
-                // TODO
+                for command in commands {
+                    match &mut state.channel[u8_from_channel(command.channel) as usize] {
+                        Some(cfg) => {
+                            cfg.current_value = command.value;
+                            cfg.changed = true;
+                        },
+                        None => (),
+                    }
+                }
 
                 driver.apply(state)?;
                 render_ui(state)?;
