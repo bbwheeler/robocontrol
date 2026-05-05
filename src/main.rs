@@ -2,8 +2,8 @@
 //! Control servos and ESCs with a PCA9685
 use std::io;
 use std::thread;
-use std::cmp;
 use std::time::{Duration, Instant};
+use std::sync::mpsc;
 
 use anyhow::{Context, Result};
 use crossterm::{
@@ -15,7 +15,8 @@ use linux_embedded_hal::I2cdev;
 use pwm_pca9685::{Address, Channel, Pca9685};
 use config::Config;
 use mavlink::ardupilotmega::MavMessage;
-use mavlink::{MavConnection, Connection};
+use mavlink::MavConnection;
+use mavlink::Connection;
 use serde::Deserialize;
 
 
@@ -89,28 +90,17 @@ struct AppConfig {
 
 impl AppConfig {
     fn from_raw(raw: RawConfig) -> Result<Self> {        
-        let mut channels: [Option<ChannelConfig>; NUMBER_OF_CHANNELS] = std::array::from_fn(|_| None);
-        for (i, ch) in raw.channel.iter().enumerate() {
-            if i < NUMBER_OF_CHANNELS {
-                channels[i] = Some(ch.try_into().expect("invalid pwm channel"));
-            }
-        }
-
-
         let channels: [Option<ChannelConfig>; 16] = convert(raw.channel)?;
         Ok(Self { i2c: raw.i2c, pwm: raw.pwm, mav: raw.mav, channel: channels, controls: raw.controls, })
     }
 }
 
 fn convert(config_vector: Vec<RawChannelConfig>) -> Result<[Option<ChannelConfig>; NUMBER_OF_CHANNELS]> {
-        let raw_iter = config_vector.iter();
-
         let mut result: [Option<ChannelConfig>; NUMBER_OF_CHANNELS] = [None; NUMBER_OF_CHANNELS];
 
-        for (i, val) in raw_iter.enumerate() {
+        for (i, val) in config_vector.into_iter().enumerate() {
             result[i] = Some(val.try_into().expect("channel invalid"));
         }
-
         Ok(result)
 }
 
@@ -132,35 +122,22 @@ impl TryFrom<RawChannelConfig> for ChannelConfig {
     }
 }
 
-impl TryFrom<&RawChannelConfig> for ChannelConfig {
-    type Error = String;
-
-    fn try_from(raw: &RawChannelConfig) -> Result<Self, Self::Error> {
-        Ok(Self {
-            pwm_channel: channel_from_u8(raw.pwm_channel)
-                .ok_or(format!("Invalid pwm_channel: {}", raw.pwm_channel))?,
-            min: raw.min,
-            max: raw.max,
-            neutral: raw.neutral,
-            mavlink_channel: raw.mavlink_channel,
-            current_value: raw.neutral,
-            changed: true,
-        })
-    }
-}
-
 struct MavLinkService {
-    connection: Connection<mavlink::ardupilotmega::MavMessage>,
+    connection: Connection<MavMessage>,
 }
 
+
+// In MavLinkService, spawn the recv thread and return a receiver
 impl MavLinkService {
     fn new(state: &AppConfig) -> Result<Self> {
-        let connection = mavlink::connect::<MavMessage>(format!("udpin:0.0.0.0:{}", state.mav.port).as_str())?;
-        Ok(Self{connection})
+        let connection = mavlink::connect::<MavMessage>(
+            format!("udpin:0.0.0.0:{}", state.mav.port).as_str()
+        )?;
+        Ok(Self { connection })
     }
 
     fn send_heart_beat(&self) -> Result<()> {
-        let heartbeat = MavMessage::HEARTBEAT(mavlink::ardupilotmega::HEARTBEAT_DATA {
+       let heartbeat = MavMessage::HEARTBEAT(mavlink::ardupilotmega::HEARTBEAT_DATA {
             custom_mode: 0,
             mavtype: mavlink::ardupilotmega::MavType::MAV_TYPE_GROUND_ROVER,
             autopilot: mavlink::ardupilotmega::MavAutopilot::MAV_AUTOPILOT_INVALID,
@@ -172,7 +149,7 @@ impl MavLinkService {
 
         self.connection.send(&mavlink::MavHeader::default(), &heartbeat)?;
         Ok(())
-    }
+     }
 }
 
 struct PwmDriver { pca: Pca9685<I2cdev> }
@@ -201,14 +178,14 @@ impl PwmDriver {
 
     fn apply(&mut self, state: &mut AppConfig) -> Result<()> {
         for c in 0..NUMBER_OF_CHANNELS {
-            match &mut state.channel[c] {
-                Some(ch) => {
+            if let Some(ch) = &mut state.channel[c] {
+                if ch.changed {
                     self.set_pulse(ch.pwm_channel, ch.current_value)?;
                     ch.changed = false;
-                } 
-                None => (),
+                }
             }
-        } 
+        }
+
         Ok(())
     }
 
@@ -223,25 +200,19 @@ impl PwmDriver {
     }
 }
 
-fn render_ui(state: &AppConfig) -> Result<()> {
+fn render_ui(state: &AppConfig, watchdog: bool) -> Result<()> {
     use io::Write;
     use crossterm::{cursor::MoveTo, terminal::{Clear, ClearType}};
     let mut stdout = io::stdout();
     execute!(stdout, MoveTo(0, 0), Clear(ClearType::All))?;
     println!("*** ROBO CONTROLLER ***");
+    println!(" Listening for MavLink Commands");
+    println!(" Ctrl+C to Quit");
     println!("");
-    println!("** Controls **");
-    println!("Steering:");
-    println!(" Left: A/←");
-    println!(" Right: D/→");
-    println!(" Forward: W/↑");
-    println!(" Reverse/Brake: S/↓");
-    println!(" Cut Throttle: Space");
-    println!(" Full Throttle: T");
-    println!(" Full Reverse: G");
-
-    println!(" Quit: Q/ESC");
-    println!("");
+    if watchdog {
+        println!("*** NO SIGNAL DETECTED ***");
+        println!("");
+    }
     println!("** Current **");
     for c in 0..NUMBER_OF_CHANNELS {
             match state.channel[c] {
@@ -280,7 +251,7 @@ fn main() -> Result<()> {
     arm_esc(&mut driver, &state)?;
     enable_raw_mode().context("Failed to enable raw terminal mode")?;
     execute!(io::stdout(), cursor::Hide)?;
-    render_ui(&state)?;
+    render_ui(&state, false)?;
     let result = run_loop(&mut driver, &mut state, mav);
     let _ = disable_raw_mode();
     let _ = execute!(io::stdout(), cursor::Show);
@@ -290,14 +261,14 @@ fn main() -> Result<()> {
 }
 
 fn load_configuration() -> Result<AppConfig> {
-    let cfg = Config::builder()
+    
+    let raw: RawConfig = Config::builder()
         .add_source(config::File::with_name("config"))
         .add_source(config::Environment::with_prefix("ROBOCONTROL"))
-        .build()    
-            .map_err(|e| anyhow::anyhow!("config error: {:?}", e));
-
-    let raw: RawConfig = cfg.expect("whatever").try_deserialize()?;
-    return AppConfig::from_raw(raw);
+        .build()
+        .map_err(|e| anyhow::anyhow!("config build error: {:?}", e))?
+        .try_deserialize()?;
+    AppConfig::from_raw(raw)
 }
 
 fn channel_from_u8(n: u8) -> Option<Channel> {
@@ -322,203 +293,192 @@ fn channel_from_u8(n: u8) -> Option<Channel> {
     }
 }
 
-fn u8_from_channel(c: Channel) -> u8 {
-    match c {
-        Channel::C0 => 0,
-        Channel::C1 => 1,
-        Channel::C2 => 2,
-        Channel::C3 => 3,
-        Channel::C4 => 4,
-        Channel::C5 => 5,
-        Channel::C6 => 6,
-        Channel::C7 => 7,
-        Channel::C8 => 8,
-        Channel::C9 => 9,
-        Channel::C10 => 10,
-        Channel::C11 => 11,
-        Channel::C12 => 12,
-        Channel::C13 => 13,
-        Channel::C14 => 14,
-        Channel::C15 => 15,
-        Channel::All => 0, // ...
-    }
-}
+fn mavlink_to_pwm(input: i16, cfg: &ChannelConfig) -> u16 {
+    let input = input.clamp(-1000, 1000);
 
-fn mavlink_to_pwm(input: u16, channel_config: &ChannelConfig) -> u16 {
     if input == 0 {
-        return channel_config.neutral;
-    } else if input > 0 {
-        return  (input as f32 / 1000.0 * ((channel_config.max - channel_config.neutral) + channel_config.neutral) as f32).round() as u16
-    } else {
-        return (input as f32/1000.0 * -1.0 * ((channel_config.neutral - channel_config.min) + channel_config.min) as f32).round() as u16
+        return cfg.neutral;
     }
+
+    if input > 0 {
+        let range = (cfg.max - cfg.neutral) as f32;
+        return cfg.neutral + ((input as f32 / 1000.0) * range).round() as u16;
+    }
+
+    let range = (cfg.neutral - cfg.min) as f32;
+    cfg.neutral - (((-input) as f32 / 1000.0) * range).round() as u16
 }
 
 fn translate_message(msg :MavMessage, state: &AppConfig) -> Vec<AbsoluteControlOutput> {
     let mut outputs: Vec<AbsoluteControlOutput> = Vec::new();
     
-    let mut throttle_channel_config: ChannelConfig = ChannelConfig { pwm_channel: Channel::C0, min: 0, max: 0, neutral: 0, mavlink_channel: 0, current_value: 0, changed: false };
-    match state.channel[state.controls.throttle as usize] {
-        Some(chan) => throttle_channel_config = chan,
-        None => (),
-    }
+    let throttle_channel_config= state.channel[state.controls.throttle as usize];
 
-    let mut steering_channel_config: ChannelConfig = ChannelConfig { pwm_channel: Channel::C0, min: 0, max: 0, neutral: 0, mavlink_channel: 0, current_value: 0, changed: false };
-    match state.channel[state.controls.steering as usize] {
-        Some(chan) => steering_channel_config = chan,
-        None => (),
-    }
+    let steering_channel_config= state.channel[state.controls.steering as usize];
     
     match msg {
         MavMessage::MANUAL_CONTROL(data) => {
-            let throttle = mavlink_to_pwm(data.x as u16, &throttle_channel_config);
-            outputs.push(AbsoluteControlOutput{
-                channel: channel_from_u8(state.controls.throttle).expect("unsupported channel"),
-                value: throttle,
-            });
-
-            // Steering can be roll or yaw
-            let steering = if data.y != 0 {
-                mavlink_to_pwm(data.y as u16, &steering_channel_config)
-            } else {
-                mavlink_to_pwm(data.r as u16, &steering_channel_config)
-            };
-
-            match channel_from_u8(state.controls.steering) {
-                Some(chan) => {
-                    outputs.push(AbsoluteControlOutput{
-                        channel: chan,
-                        value: steering,
-                    }) 
-                },
-                None => (),
+            if let Some(throttle_cfg) = throttle_channel_config {
+                outputs.push(AbsoluteControlOutput{
+                    channel: throttle_cfg.pwm_channel,
+                    value: mavlink_to_pwm(data.x, &throttle_cfg),
+                });
             }
+            
+            if let Some(steering_cfg) = steering_channel_config {
+                // Steering can be roll or yaw
+                let steering = if data.y != 0 {
+                    mavlink_to_pwm(data.y, &steering_cfg)
+                } else {
+                    mavlink_to_pwm(data.r, &steering_cfg)
+                };
 
+                outputs.push(AbsoluteControlOutput{
+                    channel: steering_cfg.pwm_channel,
+                    value: steering,
+                });
+            }
         }
  
         MavMessage::RC_CHANNELS_OVERRIDE(data) => {
+            eprintln!("RC override: ch1={} ch2={} ch3={}", 
+                data.chan1_raw, data.chan2_raw, data.chan3_raw);
+
             // 18 available channels.
             let channels: [u16; 8] = [
                 data.chan1_raw, data.chan2_raw, data.chan3_raw, data.chan4_raw,
                 data.chan5_raw, data.chan6_raw, data.chan7_raw, data.chan8_raw,
             ];
 
-            // let dummyChannelConfig: ChannelConfig = ChannelConfig { pwm_channel: Channel::C0, min: 0, max: 0, neutral: 0, mavlink_channel: 0, current_value: 0, changed: false };
+            for i in 0..channels.len() {
 
-            for i in 0..cmp::min(NUMBER_OF_CHANNELS, channels.len()) {
-
-
-                let mut channel_config: Option<&ChannelConfig> = None;
-
-                let chan_o_o = state.channel.iter().find(|&cfg| {
-                    match cfg {
-                        Some(c) => c.mavlink_channel as usize == i+1,
-                        None => false,
-                    }
-                });
-
-                match chan_o_o {
-                    Some(chan_o) => {
-                       match chan_o {
-                            Some(c) => channel_config = Some(c),
-                            None => (),
-                       } 
-                    } 
-                    None => (),
+                if channels[i] == 0 || channels[i] == 65535 {
+                    continue;
                 }
 
-                match channel_config {
-                    Some(cfg) => {
-                        outputs.push(AbsoluteControlOutput { channel: cfg.pwm_channel, value: mavlink_to_pwm(channels[i], cfg) });
-                    },
-                    None => (),
-                }
+                let channel_config: Option<&ChannelConfig> = state.channel.iter()
+                    .find(|cfg| cfg.map_or(false, |c| c.mavlink_channel as usize == i+1))
+                    .and_then(|cfg| cfg.as_ref());
 
+                // Convert
+                let ichan: i16 = (channels[i] as i32 - 1500).clamp(-1000, 1000) as i16;
+
+                if let Some(cfg) = channel_config {
+                    outputs.push(AbsoluteControlOutput { channel: cfg.pwm_channel, value: mavlink_to_pwm(ichan, cfg) });
+                }
             }
         }
  
         MavMessage::SET_ACTUATOR_CONTROL_TARGET(data) => {
             // Only handle group 0 (primary flight control group).
             if data.group_mlx == 0 {
-                match channel_from_u8(state.controls.throttle) {
-                    Some(chan) => {
-                        match state.channel[state.controls.throttle as usize] {
-                            Some(c) => {
-                                outputs.push(AbsoluteControlOutput{
-                                    channel: chan,
-                                    value: mavlink_to_pwm((data.controls[3] * 1000.0) as u16, &c),
-                                });
-                            },
-                            None => (),
-                        }
-                    },
-                    None => (),
+                if let Some(throttle_cfg) = throttle_channel_config {
+                    outputs.push(AbsoluteControlOutput{
+                        channel: throttle_cfg.pwm_channel,
+                        value: mavlink_to_pwm((data.controls[3] * 1000.0) as i16, &throttle_cfg),
+                    });
                 }
 
-                match channel_from_u8(state.controls.steering) {
-                    Some(chan) => {
-                        match state.channel[state.controls.steering as usize] {
-                            Some(c) => {
-                                outputs.push(AbsoluteControlOutput{
-                                    channel: chan,
-                                    value: mavlink_to_pwm((data.controls[0] * 1000.0) as u16, &c),
-                                });                
-                            },
-                            None => (),
-                        }
+                if let Some(steering_cfg) = steering_channel_config {
+                    outputs.push(AbsoluteControlOutput{
+                        channel: steering_cfg.pwm_channel,
+                        value: mavlink_to_pwm((data.controls[0] * 1000.0) as i16, &steering_cfg),
+                    });                
 
-                    },
-                    None => (),
                 }
             }
         }
  
         // Ignore other messages
-        _ => (),
+        _ => {
+            eprintln!("Unhandled message: {:?}", msg);
+        },
     }
 
-    return outputs;
+    outputs
 }
 
-fn run_loop(driver: &mut PwmDriver, state: &mut AppConfig, mavlink_service: MavLinkService) -> Result<()> {
+const MESSAGE_TIMEOUT: Duration = Duration::from_millis(500);
+
+fn run_loop(
+    driver: &mut PwmDriver,
+    state: &mut AppConfig,
+    mavlink_service: MavLinkService,
+) -> Result<()> {
+    let (tx, rx) = mpsc::channel::<MavMessage>();
     let mut time_since_last_heartbeat = Instant::now();
-    loop {
-        if time_since_last_heartbeat.elapsed() > HEARTBEAT_DURATION {
-            mavlink_service.send_heart_beat()?;
-            time_since_last_heartbeat = Instant::now();
-        }
+    let mut time_since_last_message: Option<Instant> = None;
+    let mut watchdog_triggered = false;
 
-        match mavlink_service.connection.recv() {
-            Ok((_header, msg)) => {
-                let commands: Vec<AbsoluteControlOutput> = translate_message(msg, state); 
-
-                for command in commands {
-                    match &mut state.channel[u8_from_channel(command.channel) as usize] {
-                        Some(cfg) => {
-                            cfg.current_value = command.value;
-                            cfg.changed = true;
-                        },
-                        None => (),
+    thread::scope(|s| {
+        s.spawn(|| {
+            loop {
+                match mavlink_service.connection.recv() {
+                    Ok((_header, msg)) => {
+                        if tx.send(msg).is_err() {
+                            break;
+                        }
+                    }
+                    Err(mavlink::error::MessageReadError::Io(e))
+                        if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            // This shouldn't happen, but it's no big deal if it does
+                        }
+                    Err(e) => {
+                        eprintln!("MAVLink recv error: {e:?}");
+                        break;
                     }
                 }
-
-                driver.apply(state)?;
-                render_ui(state)?;
             }
-            Err(mavlink::error::MessageReadError::Io(e)) => {
-                if e.kind() == std::io::ErrorKind::WouldBlock {
-                    // no messages currently available to receive -- wait a bit
-                    thread::sleep(Duration::from_millis(50));
-                    continue;
+        });
+
+        // Main loop runs in the scope too, so the scope (and the thread) 
+        // can't outlive mavlink_service
+        loop {
+            if time_since_last_heartbeat.elapsed() > HEARTBEAT_DURATION {
+                mavlink_service.send_heart_beat()?;
+                time_since_last_heartbeat = Instant::now();
+            }
+
+            if let Some(t) = time_since_last_message {
+                if t.elapsed() > MESSAGE_TIMEOUT {
+                    if !watchdog_triggered {
+                        eprintln!("WARNING: No MAVLink message for {}ms — going neutral",
+                            MESSAGE_TIMEOUT.as_millis());
+                        driver.safe_stop(state)?;
+                        watchdog_triggered = true;
+                    }
                 } else {
-                    println!("recv error: {e:?}");
+                    watchdog_triggered = false;
+                }
+            }
+
+            match rx.recv_timeout(HEARTBEAT_DURATION) {
+                Ok(msg) => {
+                    time_since_last_message = Some(Instant::now());
+                    let commands = translate_message(msg, state);
+                    for command in commands {
+                        for c in 0..NUMBER_OF_CHANNELS {
+                            if let Some(cfg) = &mut state.channel[c] {
+                                if cfg.pwm_channel == command.channel {
+                                    cfg.current_value = command.value;
+                                    cfg.changed = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    driver.apply(state)?;
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    eprintln!("MAVLink recv thread died — stopping");
+                    driver.safe_stop(state)?;
                     break;
                 }
             }
-            // messages that didn't get through due to parser errors are ignored
-            _ => {}
+            render_ui(state, watchdog_triggered)?;
         }
-    }
 
-    Ok(())
+        Ok(())
+    })
 }
