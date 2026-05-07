@@ -13,9 +13,10 @@ use crossterm::{
     cursor,
 };
 use linux_embedded_hal::I2cdev;
+use mavlink::Message;
 use pwm_pca9685::{Address, Channel, Pca9685};
 use config::Config;
-use mavlink::ardupilotmega::MavMessage;
+use mavlink::common::MavMessage;
 use mavlink::MavConnection;
 use mavlink::Connection;
 use serde::Deserialize;
@@ -155,21 +156,23 @@ struct MavLinkService {
 
 impl MavLinkService {
     fn new(state: &AppConfig) -> Result<Self> {
-        let connection = mavlink::connect::<MavMessage>(
+        let mut connection = mavlink::connect::<MavMessage>(
             format!("udpin:0.0.0.0:{}", state.mav.port).as_str(),
         )?;
+        connection.set_protocol_version(mavlink::MavlinkVersion::V2);
+        connection.set_allow_recv_any_version(true);
         Ok(Self { connection })
     }
 
     fn send_heart_beat(&self) -> Result<()> {
         let heartbeat =
-            MavMessage::HEARTBEAT(mavlink::ardupilotmega::HEARTBEAT_DATA {
+            MavMessage::HEARTBEAT(mavlink::common::HEARTBEAT_DATA {
                 custom_mode: 0,
-                mavtype: mavlink::ardupilotmega::MavType::MAV_TYPE_GROUND_ROVER,
-                autopilot: mavlink::ardupilotmega::MavAutopilot::MAV_AUTOPILOT_INVALID,
-                base_mode: mavlink::ardupilotmega::MavModeFlag::empty(),
-                system_status: mavlink::ardupilotmega::MavState::MAV_STATE_STANDBY,
-                mavlink_version: 0x3,
+                mavtype: mavlink::common::MavType::MAV_TYPE_GROUND_ROVER,
+                autopilot: mavlink::common::MavAutopilot::MAV_AUTOPILOT_GENERIC,
+                base_mode: mavlink::common::MavModeFlag::empty(),
+                system_status: mavlink::common::MavState::MAV_STATE_STANDBY,
+                mavlink_version: 0xFD,
             });
         self.connection.send(&mavlink::MavHeader::default(), &heartbeat)?;
         Ok(())
@@ -336,10 +339,6 @@ fn translate_message(msg: MavMessage, state: &AppConfig) -> Vec<AbsoluteControlO
         }
 
         MavMessage::RC_CHANNELS_OVERRIDE(data) => {
-            eprintln!(
-                "RC override: ch1={} ch2={} ch3={}",
-                data.chan1_raw, data.chan2_raw, data.chan3_raw
-            );
             let channels: [u16; 8] = [
                 data.chan1_raw, data.chan2_raw, data.chan3_raw, data.chan4_raw,
                 data.chan5_raw, data.chan6_raw, data.chan7_raw, data.chan8_raw,
@@ -502,6 +501,7 @@ fn run_loop(
         // MAVLink receiver thread
         s.spawn(|| {
             loop {
+
                 match mavlink_service.connection.recv() {
                     Ok((_header, msg)) => {
                         if mav_tx.send(msg).is_err() {
