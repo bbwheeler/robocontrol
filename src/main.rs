@@ -298,18 +298,35 @@ fn channel_from_u8(n: u8) -> Option<Channel> {
     }
 }
 
-fn mavlink_to_pwm(input: i16, cfg: &ChannelConfig) -> u16 {
-    let input = input.clamp(-1000, 1000);
-    if input == 0 {
+fn mavlink_raw_to_pwm(input: u16, cfg: &ChannelConfig) -> u16 {
+    const RAW_MAX: u16 = 2000;
+    const RAW_MIN: u16 = 1000;
+    
+    if input == 0 || input == u16::MAX {
+        return mavlink_scaled_to_pwm(i16::MAX, cfg);
+    }
+
+    let clamped_input = input.clamp(RAW_MIN, RAW_MAX);
+
+    let scaled_value: i16 = ((((clamped_input - RAW_MIN) as f32 / (RAW_MAX - RAW_MIN) as f32  ) * 2.0 - 1.0) * 10000.0).round() as i16;
+
+    return mavlink_scaled_to_pwm(scaled_value, cfg);
+}
+
+fn mavlink_scaled_to_pwm(input: i16, cfg: &ChannelConfig) -> u16 {
+    if input == i16::MAX {
         return cfg.neutral;
     }
-    if input > 0 {
+
+    let input = input.clamp(-10000, 10000);
+    if input >= 0 {
         let range = (cfg.max - cfg.neutral) as f32;
-        return cfg.neutral + ((input as f32 / 1000.0) * range).round() as u16;
+        return cfg.neutral + ((input as f32 / 10000.0) * range).round() as u16;
     }
     let range = (cfg.neutral - cfg.min) as f32;
-    cfg.neutral - (((-input) as f32 / 1000.0) * range).round() as u16
+    cfg.neutral - (((-input) as f32 / 10000.0) * range).round() as u16
 }
+
 
 fn translate_message(msg: MavMessage, state: &AppConfig) -> Vec<AbsoluteControlOutput> {
     let mut outputs: Vec<AbsoluteControlOutput> = Vec::new();
@@ -321,14 +338,14 @@ fn translate_message(msg: MavMessage, state: &AppConfig) -> Vec<AbsoluteControlO
             if let Some(throttle_cfg) = throttle_channel_config {
                 outputs.push(AbsoluteControlOutput {
                     channel: throttle_cfg.pwm_channel,
-                    value: mavlink_to_pwm(data.x, &throttle_cfg),
+                    value: mavlink_scaled_to_pwm(data.x, &throttle_cfg),
                 });
             }
             if let Some(steering_cfg) = steering_channel_config {
                 let steering = if data.y != 0 {
-                    mavlink_to_pwm(data.y, &steering_cfg)
+                    mavlink_scaled_to_pwm(data.y, &steering_cfg)
                 } else {
-                    mavlink_to_pwm(data.r, &steering_cfg)
+                    mavlink_scaled_to_pwm(data.r, &steering_cfg)
                 };
                 outputs.push(AbsoluteControlOutput {
                     channel: steering_cfg.pwm_channel,
@@ -343,7 +360,7 @@ fn translate_message(msg: MavMessage, state: &AppConfig) -> Vec<AbsoluteControlO
                 data.chan5_raw, data.chan6_raw, data.chan7_raw, data.chan8_raw,
             ];
             for i in 0..channels.len() {
-                if channels[i] == 0 || channels[i] == 65535 {
+                if channels[i] == 0 || channels[i] == u16::MAX {
                     continue;
                 }
                 let channel_config: Option<&ChannelConfig> = state
@@ -351,12 +368,10 @@ fn translate_message(msg: MavMessage, state: &AppConfig) -> Vec<AbsoluteControlO
                     .iter()
                     .find(|cfg| cfg.map_or(false, |c| c.mavlink_channel as usize == i + 1))
                     .and_then(|cfg| cfg.as_ref());
-                let ichan: i16 =
-                    (channels[i] as i32 - 1500).clamp(-1000, 1000) as i16;
                 if let Some(cfg) = channel_config {
                     outputs.push(AbsoluteControlOutput {
                         channel: cfg.pwm_channel,
-                        value: mavlink_to_pwm(ichan, cfg),
+                        value: mavlink_raw_to_pwm(channels[i], cfg),
                     });
                 }
             }
@@ -367,8 +382,8 @@ fn translate_message(msg: MavMessage, state: &AppConfig) -> Vec<AbsoluteControlO
                 if let Some(throttle_cfg) = throttle_channel_config {
                     outputs.push(AbsoluteControlOutput {
                         channel: throttle_cfg.pwm_channel,
-                        value: mavlink_to_pwm(
-                            (data.controls[3] * 1000.0) as i16,
+                        value: mavlink_scaled_to_pwm(
+                            (data.controls[3] * 10000.0) as i16,
                             &throttle_cfg,
                         ),
                     });
@@ -376,8 +391,8 @@ fn translate_message(msg: MavMessage, state: &AppConfig) -> Vec<AbsoluteControlO
                 if let Some(steering_cfg) = steering_channel_config {
                     outputs.push(AbsoluteControlOutput {
                         channel: steering_cfg.pwm_channel,
-                        value: mavlink_to_pwm(
-                            (data.controls[0] * 1000.0) as i16,
+                        value: mavlink_scaled_to_pwm(
+                            (data.controls[0] * 10000.0) as i16,
                             &steering_cfg,
                         ),
                     });
