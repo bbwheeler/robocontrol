@@ -3,7 +3,7 @@ address = 0x40
 path = "/dev/i2c-1"
 
 [pwm]
-prescale = 121
+prescale = 110
 
 [mav]
 port = 14550
@@ -15,16 +15,16 @@ throttle = 1
 # Steering
 [[channel]]
 pwm_channel = 0
-min = 200
-max = 600
+min = 225
+max = 575
 neutral = 400
 mavlink_channel = 1
 
 # Throttle
 [[channel]]
 pwm_channel = 1
-min = 205
-max = 409
-neutral = 307
+min = 200
+max = 600
+neutral = 400
 mavlink_channel = 3
 
