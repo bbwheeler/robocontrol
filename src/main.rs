@@ -13,7 +13,6 @@ use crossterm::{
     cursor,
 };
 use linux_embedded_hal::I2cdev;
-use mavlink::Message;
 use pwm_pca9685::{Address, Channel, Pca9685};
 use config::Config;
 use mavlink::common::MavMessage;
