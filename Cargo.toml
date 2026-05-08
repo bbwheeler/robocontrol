@@ -10,5 +10,6 @@ crossterm = "0.29.0"
 env_logger = "0.11.10"
 linux-embedded-hal = "0.4.1"
 log = "0.4.29"
+mavlink = "0.17.1"
 pwm-pca9685 = "1.0.0"
 serde = {version = "1.0.228", features = ["derive"]}
