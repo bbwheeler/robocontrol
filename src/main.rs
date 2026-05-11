@@ -1,17 +1,16 @@
 //! RoboControl
 //! Control servos and ESCs with a PCA9685
-use std::io;
 use std::thread;
 use std::time::{Duration, Instant};
 use std::sync::mpsc;
 
-use anyhow::{Context, Result};
+
 use crossterm::{
     event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
-    terminal::{disable_raw_mode, enable_raw_mode},
-    execute,
-    cursor,
 };
+
+
+use anyhow::{Context, Result};
 use linux_embedded_hal::I2cdev;
 use pwm_pca9685::{Address, Channel, Pca9685};
 use config::Config;
@@ -224,31 +223,6 @@ impl PwmDriver {
         }
         Ok(())
     }
-}
-
-// ── UI ────────────────────────────────────────────────────────────────────────
-
-fn render_ui(state: &AppConfig, watchdog: bool) -> Result<()> {
-    use io::Write;
-    use crossterm::{cursor::MoveTo, terminal::{Clear, ClearType}};
-    let mut stdout = io::stdout();
-    execute!(stdout, MoveTo(0, 0), Clear(ClearType::All))?;
-    println!("*** ROBO CONTROLLER ***");
-    println!(" Listening for MavLink Commands");
-    println!(" Arrow keys: throttle (↑↓) / steer (←→)  |  Space: neutral  |  Q: quit");
-    println!();
-    if watchdog {
-        println!("*** NO SIGNAL DETECTED ***");
-        println!();
-    }
-    println!("** Current **");
-    for c in 0..NUMBER_OF_CHANNELS {
-        if let Some(ch) = state.channel[c] {
-            println!("Channel {}: {}", c, ch.current_value);
-        }
-    }
-    stdout.flush()?;
-    Ok(())
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -642,8 +616,6 @@ fn run_loop(
                 driver.safe_stop(state)?;
                 break;
             }
-
-            render_ui(state, watchdog_triggered)?;
         }
 
         Ok(())
@@ -666,14 +638,9 @@ fn main() -> Result<()> {
     let mav = MavLinkService::new(&state)?;
 
     arm_esc(&mut driver, &state)?;
-    enable_raw_mode().context("Failed to enable raw terminal mode")?;
-    execute!(io::stdout(), cursor::Hide)?;
-    render_ui(&state, false)?;
 
     let result = run_loop(&mut driver, &mut state, mav);
 
-    let _ = disable_raw_mode();
-    let _ = execute!(io::stdout(), cursor::Show);
     driver.safe_stop(&state)?;
     println!("\nRC robo controller stopped. Goodbye!");
     result
