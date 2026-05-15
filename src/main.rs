@@ -24,6 +24,9 @@ const NUMBER_OF_CHANNELS: usize = 16;
 
 const HEARTBEAT_DURATION: Duration = Duration::from_secs(1);
 
+// The control loop should not update more than 50Hz to avoid confusing the servos
+const CONTROL_LOOP_MIN_DURATION: Duration = Duration::from_millis(20);
+
 /// How much a single keypress moves the PWM value (in raw PWM ticks).
 /// Tune this to taste — 10 ticks is roughly 1 % of a typical 1000-tick range.
 const KEY_STEP: i32 = 10;
@@ -65,6 +68,7 @@ struct RawChannelConfig {
     max: u16,
     neutral: u16,
     mavlink_channel: u8,
+    max_step: u16,
 }
 
 #[derive(Debug, Deserialize)]
@@ -85,6 +89,7 @@ struct ChannelConfig {
     mavlink_channel: u8,
     current_value: u16,
     changed: bool,
+    max_step: u16,
 }
 
 struct AbsoluteControlOutput {
@@ -142,6 +147,7 @@ impl TryFrom<RawChannelConfig> for ChannelConfig {
             mavlink_channel: raw.mavlink_channel,
             current_value: raw.neutral,
             changed: true,
+            max_step: raw.max_step,
         })
     }
 }
@@ -458,6 +464,14 @@ fn reset_channel(state: &mut AppConfig, channel_idx: u8) {
     }
 }
 
+fn slew(current: u16, target: u16, max_step: u16) -> u16 {
+    if target > current {
+        (current + max_step).min(target)
+    } else {
+        current.saturating_sub(max_step).max(target)
+    }    
+}
+
 // ── Main loop ─────────────────────────────────────────────────────────────────
 
 const MESSAGE_TIMEOUT: Duration = Duration::from_millis(500);
@@ -481,6 +495,7 @@ fn run_loop(
     let mut time_since_last_message: Option<Instant> = None;
     let mut watchdog_triggered = false;
     let mut quit_requested = false;
+    let mut time_since_last_update: Instant = Instant::now();
 
     // Spawn the keyboard listener
     spawn_keyboard_thread(key_tx);
@@ -508,6 +523,17 @@ fn run_loop(
 
         // Main control loop
         loop {
+
+            // TODO: Refactor the control loop to call an "update hardware" function instead of driver.apply directly.
+            // Have the hardware update at the end of the loop, only if >= min update time, then reset last update time
+            // Then, remove the below sleep and update polling to be faster.
+
+            // Don't update too fast for the sake of the servos
+            if time_since_last_update.elapsed() < CONTROL_LOOP_MIN_DURATION {
+                thread::sleep(CONTROL_LOOP_MIN_DURATION - time_since_last_update.elapsed());
+                time_since_last_update = Instant::now();
+            }
+
             // ── Heartbeat ────────────────────────────────────────────────────
             if time_since_last_heartbeat.elapsed() > HEARTBEAT_DURATION {
                 mavlink_service.send_heart_beat()?;
@@ -531,9 +557,7 @@ fn run_loop(
             }
 
             // ── Collect events (MAVLink + keyboard) ───────────────────────
-            // Use a short timeout so both queues are drained quickly and the
-            // heartbeat & watchdog timers stay responsive.
-            let poll_timeout = Duration::from_millis(20);
+            let poll_timeout = CONTROL_LOOP_MIN_DURATION;
 
             let mut events: Vec<LoopEvent> = Vec::new();
 
@@ -570,7 +594,7 @@ fn run_loop(
                             for c in 0..NUMBER_OF_CHANNELS {
                                 if let Some(cfg) = &mut state.channel[c] {
                                     if cfg.pwm_channel == command.channel {
-                                        cfg.current_value = command.value;
+                                        cfg.current_value = slew(cfg.current_value, command.value, cfg.max_step);
                                         cfg.changed = true;
                                         break;
                                     }
