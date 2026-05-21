@@ -222,11 +222,15 @@ impl PwmDriver {
     }
 
     fn safe_stop(&mut self, state: &AppConfig) -> Result<()> {
+
         for c in 0..NUMBER_OF_CHANNELS {
-            if let Some(ch) = state.channel[c] {
-                self.set_pulse(ch.pwm_channel, ch.neutral)?;
+            if let Some(cfg) = &mut state.channel[c] {
+                cfg.current_value = cfg.neutral;
+                cfg.changed = true;
+                break;
             }
         }
+        driver.apply(state)?;
         Ok(())
     }
 }
@@ -468,7 +472,7 @@ fn slew(current: u16, target: u16, max_step: u16) -> u16 {
     if target > current {
         (current + max_step).min(target)
     } else {
-        current.saturating_sub(max_step).max(target)
+        (current - max_step).max(target)
     }    
 }
 

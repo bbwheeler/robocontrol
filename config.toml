@@ -19,7 +19,7 @@ min = 225
 max = 575
 neutral = 400
 mavlink_channel = 1
-max_step = 4
+max_step = 12
 
 # Throttle
 [[channel]]
@@ -28,4 +28,4 @@ min = 200
 max = 600
 neutral = 400
 mavlink_channel = 3
-max_step = 4
+max_step = 12
