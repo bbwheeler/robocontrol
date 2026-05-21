@@ -221,8 +221,7 @@ impl PwmDriver {
         Ok(())
     }
 
-    fn safe_stop(&mut self, state: &AppConfig) -> Result<()> {
-
+    fn safe_stop(&mut self, state: &mut AppConfig) -> Result<()> {
         for c in 0..NUMBER_OF_CHANNELS {
             if let Some(cfg) = &mut state.channel[c] {
                 cfg.current_value = cfg.neutral;
@@ -230,7 +229,8 @@ impl PwmDriver {
                 break;
             }
         }
-        driver.apply(state)?;
+
+        self.apply(state)?;
         Ok(())
     }
 }
@@ -669,7 +669,7 @@ fn main() -> Result<()> {
 
     let result = run_loop(&mut driver, &mut state, mav);
 
-    driver.safe_stop(&state)?;
+    driver.safe_stop(&mut state)?;
     println!("\nRC robo controller stopped. Goodbye!");
     result
 }
