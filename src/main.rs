@@ -391,73 +391,9 @@ fn translate_message(msg: MavMessage, state: &AppConfig) -> Vec<AbsoluteControlO
     outputs
 }
 
-// ── Keyboard thread ───────────────────────────────────────────────────────────
-
-/// Spawn a thread that translates crossterm key events into `KeyCommand`s and
-/// forwards them over `tx`.  The thread exits when `tx` is dropped (i.e. when
-/// the main loop returns), or when the user presses Q / Ctrl-C.
-fn spawn_keyboard_thread(tx: mpsc::Sender<KeyCommand>) {
-    thread::spawn(move || {
-        loop {
-            // poll with a short timeout so we don't block forever if tx dies
-            match event::poll(Duration::from_millis(50)) {
-                Ok(true) => {}
-                Ok(false) => continue,
-                Err(_) => break,
-            }
-
-            let ev = match event::read() {
-                Ok(e) => e,
-                Err(_) => break,
-            };
-
-            let cmd = match ev {
-                Event::Key(KeyEvent { code, modifiers, .. }) => match code {
-                    KeyCode::Up    => Some(KeyCommand::ThrottleUp),
-                    KeyCode::Down  => Some(KeyCommand::ThrottleDown),
-                    KeyCode::Left  => Some(KeyCommand::SteerLeft),
-                    KeyCode::Right => Some(KeyCommand::SteerRight),
-                    KeyCode::Char(' ') => Some(KeyCommand::Neutral),
-                    KeyCode::Char('q') | KeyCode::Char('Q') => Some(KeyCommand::Quit),
-                    KeyCode::Char('c')
-                        if modifiers.contains(KeyModifiers::CONTROL) =>
-                    {
-                        Some(KeyCommand::Quit)
-                    }
-                    _ => None,
-                },
-                _ => None,
-            };
-
-            if let Some(cmd) = cmd {
-                if tx.send(cmd).is_err() {
-                    break; // main loop has exited
-                }
-            }
-        }
-    });
-}
-
-// ── Apply a KeyCommand to AppConfig ──────────────────────────────────────────
-
 /// Clamp a PWM value inside the channel's [min, max] range.
 fn clamp_to_channel(value: i32, cfg: &ChannelConfig) -> u16 {
     value.clamp(cfg.min as i32, cfg.max as i32) as u16
-}
-
-/// Apply one keyboard step to a single channel index, returning whether the
-/// channel existed.
-fn apply_key_step(state: &mut AppConfig, channel_idx: u8, delta: i32) -> bool {
-    if let Some(cfg) = &mut state.channel[channel_idx as usize] {
-        let next = clamp_to_channel(cfg.current_value as i32 + delta, cfg);
-        if next != cfg.current_value {
-            cfg.current_value = next;
-            cfg.changed = true;
-        }
-        true
-    } else {
-        false
-    }
 }
 
 /// Reset a single channel to neutral.
@@ -483,7 +419,6 @@ const MESSAGE_TIMEOUT: Duration = Duration::from_millis(500);
 /// Combined event for the main select loop.
 enum LoopEvent {
     Mav(MavMessage),
-    Key(KeyCommand),
 }
 
 fn run_loop(
@@ -491,18 +426,14 @@ fn run_loop(
     state: &mut AppConfig,
     mavlink_service: MavLinkService,
 ) -> Result<()> {
-    // Two channels funnelled into one via LoopEvent
+    // Control channels funnelled into one via LoopEvent
     let (mav_tx, mav_rx) = mpsc::channel::<MavMessage>();
-    let (key_tx, key_rx) = mpsc::channel::<KeyCommand>();
 
     let mut time_since_last_heartbeat = Instant::now();
     let mut time_since_last_message: Option<Instant> = None;
     let mut watchdog_triggered = false;
     let mut quit_requested = false;
     let mut time_since_last_update: Instant = Instant::now();
-
-    // Spawn the keyboard listener
-    spawn_keyboard_thread(key_tx);
 
     thread::scope(|s| {
         // MAVLink receiver thread
@@ -579,15 +510,6 @@ fn run_loop(
                 // Only block on the very first recv; drain the rest instantly
             }
 
-            // Drain all pending keyboard events
-            loop {
-                match key_rx.try_recv() {
-                    Ok(cmd) => events.push(LoopEvent::Key(cmd)),
-                    Err(mpsc::TryRecvError::Empty) => break,
-                    Err(mpsc::TryRecvError::Disconnected) => break,
-                }
-            }
-
             // ── Process events ────────────────────────────────────────────
             for ev in events {
                 match ev {
@@ -606,36 +528,6 @@ fn run_loop(
                             }
                         }
                         driver.apply(state)?;
-                    }
-
-                    LoopEvent::Key(cmd) => {
-                        match cmd {
-                            KeyCommand::Quit => {
-                                quit_requested = true;
-                            }
-                            KeyCommand::Neutral => {
-                                driver.safe_stop(state)?;
-                                // Reset in-memory state to neutral too
-                                reset_channel(state, state.controls.throttle);
-                                reset_channel(state, state.controls.steering);
-                            }
-                            KeyCommand::ThrottleUp => {
-                                apply_key_step(state, state.controls.throttle, KEY_STEP);
-                                driver.apply(state)?;
-                            }
-                            KeyCommand::ThrottleDown => {
-                                apply_key_step(state, state.controls.throttle, -KEY_STEP);
-                                driver.apply(state)?;
-                            }
-                            KeyCommand::SteerLeft => {
-                                apply_key_step(state, state.controls.steering, -KEY_STEP);
-                                driver.apply(state)?;
-                            }
-                            KeyCommand::SteerRight => {
-                                apply_key_step(state, state.controls.steering, KEY_STEP);
-                                driver.apply(state)?;
-                            }
-                        }
                     }
                 }
             }
