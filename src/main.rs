@@ -4,12 +4,6 @@ use std::thread;
 use std::time::{Duration, Instant};
 use std::sync::mpsc;
 
-
-use crossterm::{
-    event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
-};
-
-
 use anyhow::{Context, Result};
 use linux_embedded_hal::I2cdev;
 use pwm_pca9685::{Address, Channel, Pca9685};
@@ -27,21 +21,7 @@ const HEARTBEAT_DURATION: Duration = Duration::from_secs(1);
 // The control loop should not update more than 50Hz to avoid confusing the servos
 const CONTROL_LOOP_MIN_DURATION: Duration = Duration::from_millis(20);
 
-/// How much a single keypress moves the PWM value (in raw PWM ticks).
-/// Tune this to taste — 10 ticks is roughly 1 % of a typical 1000-tick range.
-const KEY_STEP: i32 = 10;
-
-// ── Key events sent from the keyboard thread ─────────────────────────────────
-
 #[derive(Debug, Clone, Copy)]
-enum KeyCommand {
-    ThrottleUp,
-    ThrottleDown,
-    SteerLeft,
-    SteerRight,
-    Neutral,   // space — instant safe-stop
-    Quit,
-}
 
 // ── Config types ──────────────────────────────────────────────────────────────
 
@@ -432,7 +412,6 @@ fn run_loop(
     let mut time_since_last_heartbeat = Instant::now();
     let mut time_since_last_message: Option<Instant> = None;
     let mut watchdog_triggered = false;
-    let mut quit_requested = false;
     let mut time_since_last_update: Instant = Instant::now();
 
     thread::scope(|s| {
@@ -491,7 +470,6 @@ fn run_loop(
                 }
             }
 
-            // ── Collect events (MAVLink + keyboard) ───────────────────────
             let poll_timeout = CONTROL_LOOP_MIN_DURATION;
 
             let mut events: Vec<LoopEvent> = Vec::new();
@@ -530,11 +508,6 @@ fn run_loop(
                         driver.apply(state)?;
                     }
                 }
-            }
-
-            if quit_requested {
-                driver.safe_stop(state)?;
-                break;
             }
         }
 
