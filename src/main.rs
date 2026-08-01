@@ -206,7 +206,6 @@ impl PwmDriver {
             if let Some(cfg) = &mut state.channel[c] {
                 cfg.current_value = cfg.neutral;
                 cfg.changed = true;
-                break;
             }
         }
 
