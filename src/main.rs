@@ -1,5 +1,6 @@
 //! RoboControl
 //! Control servos and ESCs with a PCA9685
+use std::collections::HashMap;
 use std::thread;
 use std::time::{Duration, Instant};
 use std::sync::mpsc;
@@ -89,6 +90,7 @@ struct AppConfig {
     mav: MavlinkConfig,
     channel: [Option<ChannelConfig>; NUMBER_OF_CHANNELS],
     controls: Controls,
+    mavlink_channel_map: HashMap<u8, usize>,
 }
 
 impl AppConfig {
@@ -437,15 +439,18 @@ fn run_loop(
         // Main control loop
         loop {
 
-            // TODO: Refactor the control loop to call an "update hardware" function instead of driver.apply directly.
-            // Have the hardware update at the end of the loop, only if >= min update time, then reset last update time
-            // Then, remove the below sleep and update polling to be faster.
+            let elapsed = time_since_last_update.elapsed();
+            let should_update_hw = elapsed >= CONTROL_LOOP_MIN_DURATION;
 
-            // Don't update too fast for the sake of the servos
-            if time_since_last_update.elapsed() < CONTROL_LOOP_MIN_DURATION {
-                thread::sleep(CONTROL_LOOP_MIN_DURATION - time_since_last_update.elapsed());
+            if should_update_hw {
                 time_since_last_update = Instant::now();
             }
+
+            let poll_timeout = if should_update_hw {
+                Duration::from_millis(0)
+            } else {
+                CONTROL_LOOP_MIN_DURATION - elapsed
+            };
 
             // ── Heartbeat ────────────────────────────────────────────────────
             if time_since_last_heartbeat.elapsed() > HEARTBEAT_DURATION {
@@ -469,8 +474,6 @@ fn run_loop(
                 }
             }
 
-            let poll_timeout = CONTROL_LOOP_MIN_DURATION;
-
             let mut events: Vec<LoopEvent> = Vec::new();
 
             // Drain all pending MAVLink messages
@@ -487,7 +490,7 @@ fn run_loop(
                 // Only block on the very first recv; drain the rest instantly
             }
 
-            // ── Process events ────────────────────────────────────────────
+            // ── Process events ─────────────────────────────────────────────
             for ev in events {
                 match ev {
                     LoopEvent::Mav(msg) => {
@@ -504,9 +507,13 @@ fn run_loop(
                                 }
                             }
                         }
-                        driver.apply(state)?;
                     }
                 }
+            }
+
+            // Apply hardware updates only when the minimum interval has elapsed
+            if should_update_hw {
+                driver.apply(state)?;
             }
         }
 
