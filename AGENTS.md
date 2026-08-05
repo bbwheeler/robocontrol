@@ -2,8 +2,6 @@
 
 ## Architecture
 
-All source is in `src/main.rs`. Single-module binary: no libraries, no tests, no feature flags.
-
 `config.toml` drives I2C bus address, PWM prescale, and per-channel pulse-width bounds (min/max/neutral/mavlink_channel). The `ROBOCONTROL_` environment prefix also merges into config via the `config` crate.
 
 ## Developer commands
@@ -13,7 +11,7 @@ cargo build --release       # builds for Raspberry Pi target
 RUST_LOG=debug cargo run    # run with logging
 ```
 
-No test framework, no linter, no formatter. This runs on a Raspberry Pi with a PCA9685 hat — it will not compile or execute on desktop.
+This runs on a Raspberry Pi with a PCA9685 on the I2C interface — it will not compile or execute on desktop.
 
 ## Gotchas
 
@@ -21,4 +19,3 @@ No test framework, no linter, no formatter. This runs on a Raspberry Pi with a P
 - **Watchdog failsafe**: After 500ms without a MAVLink message, all channels go neutral.
 - **MAVLink ports**: Default listens on `udp in :14550` (set by `[mav].port` in config).
 - **Channel mapping**: Each channel entry maps one PWM hardware channel to one MAVLink raw value (1000–2000 µs range) and/or scaled input (-10000–10000). Look at `translate_message()` and the `mavlink_*_to_pwm()` helpers for scaling logic.
-- **No keyboard input in current code**: The `crossterm` dependency in `Cargo.toml` is unused — it's a leftover from an earlier keyboard-controlled version. Don't add any crossterm-related code unless explicitly requested.
