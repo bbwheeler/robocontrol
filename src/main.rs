@@ -1,17 +1,11 @@
 //! RoboControl
 //! Control servos and ESCs with a PCA9685
-use std::io;
+use std::collections::HashMap;
 use std::thread;
 use std::time::{Duration, Instant};
 use std::sync::mpsc;
 
 use anyhow::{Context, Result};
-use crossterm::{
-    event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
-    terminal::{disable_raw_mode, enable_raw_mode},
-    execute,
-    cursor,
-};
 use linux_embedded_hal::I2cdev;
 use pwm_pca9685::{Address, Channel, Pca9685};
 use config::Config;
@@ -25,21 +19,10 @@ const NUMBER_OF_CHANNELS: usize = 16;
 
 const HEARTBEAT_DURATION: Duration = Duration::from_secs(1);
 
-/// How much a single keypress moves the PWM value (in raw PWM ticks).
-/// Tune this to taste — 10 ticks is roughly 1 % of a typical 1000-tick range.
-const KEY_STEP: i32 = 10;
-
-// ── Key events sent from the keyboard thread ─────────────────────────────────
+// The control loop should not update more than 50Hz to avoid confusing the servos
+const CONTROL_LOOP_MIN_DURATION: Duration = Duration::from_millis(20);
 
 #[derive(Debug, Clone, Copy)]
-enum KeyCommand {
-    ThrottleUp,
-    ThrottleDown,
-    SteerLeft,
-    SteerRight,
-    Neutral,   // space — instant safe-stop
-    Quit,
-}
 
 // ── Config types ──────────────────────────────────────────────────────────────
 
@@ -66,6 +49,7 @@ struct RawChannelConfig {
     max: u16,
     neutral: u16,
     mavlink_channel: u8,
+    max_step: u16,
 }
 
 #[derive(Debug, Deserialize)]
@@ -86,6 +70,18 @@ struct ChannelConfig {
     mavlink_channel: u8,
     current_value: u16,
     changed: bool,
+    max_step: u16,
+}
+
+struct AbsoluteControlOutput {
+    channel: Channel,
+    value: u16,
+}
+
+#[derive(Debug, Deserialize)]
+struct Controls {
+    steering: u8,
+    throttle: u8,
 }
 
 struct AbsoluteControlOutput {
@@ -105,6 +101,7 @@ struct AppConfig {
     mav: MavlinkConfig,
     channel: [Option<ChannelConfig>; NUMBER_OF_CHANNELS],
     controls: Controls,
+    mavlink_channel_map: HashMap<u8, usize>,
 }
 
 impl AppConfig {
@@ -143,6 +140,7 @@ impl TryFrom<RawChannelConfig> for ChannelConfig {
             mavlink_channel: raw.mavlink_channel,
             current_value: raw.neutral,
             changed: true,
+            max_step: raw.max_step,
         })
     }
 }
@@ -216,40 +214,20 @@ impl PwmDriver {
         Ok(())
     }
 
-    fn safe_stop(&mut self, state: &AppConfig) -> Result<()> {
+    fn safe_stop(&mut self, state: &mut AppConfig) -> Result<()> {
         for c in 0..NUMBER_OF_CHANNELS {
-            if let Some(ch) = state.channel[c] {
-                self.set_pulse(ch.pwm_channel, ch.neutral)?;
+            if let Some(cfg) = &mut state.channel[c] {
+                cfg.current_value = cfg.neutral;
+                cfg.changed = true;
             }
         }
+
+        self.apply(state)?;
         Ok(())
     }
 }
 
-// ── UI ────────────────────────────────────────────────────────────────────────
-
-fn render_ui(state: &AppConfig, watchdog: bool) -> Result<()> {
-    use io::Write;
-    use crossterm::{cursor::MoveTo, terminal::{Clear, ClearType}};
-    let mut stdout = io::stdout();
-    execute!(stdout, MoveTo(0, 0), Clear(ClearType::All))?;
-    println!("*** ROBO CONTROLLER ***");
-    println!(" Listening for MavLink Commands");
-    println!(" Arrow keys: throttle (↑↓) / steer (←→)  |  Space: neutral  |  Q: quit");
-    println!();
-    if watchdog {
-        println!("*** NO SIGNAL DETECTED ***");
-        println!();
-    }
-    println!("** Current **");
-    for c in 0..NUMBER_OF_CHANNELS {
-        if let Some(ch) = state.channel[c] {
-            println!("Channel {}: {}", c, ch.current_value);
-        }
-    }
-    stdout.flush()?;
-    Ok(())
-}
+// ── Helpers ───────────────────────────────────────────────────────────────────
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -298,18 +276,35 @@ fn channel_from_u8(n: u8) -> Option<Channel> {
     }
 }
 
-fn mavlink_to_pwm(input: i16, cfg: &ChannelConfig) -> u16 {
-    let input = input.clamp(-1000, 1000);
-    if input == 0 {
+fn mavlink_raw_to_pwm(input: u16, cfg: &ChannelConfig) -> u16 {
+    const RAW_MAX: u16 = 2000;
+    const RAW_MIN: u16 = 1000;
+    
+    if input == 0 || input == u16::MAX {
+        return mavlink_scaled_to_pwm(i16::MAX, cfg);
+    }
+
+    let clamped_input = input.clamp(RAW_MIN, RAW_MAX);
+
+    let scaled_value: i16 = ((((clamped_input - RAW_MIN) as f32 / (RAW_MAX - RAW_MIN) as f32  ) * 2.0 - 1.0) * 10000.0).round() as i16;
+
+    return mavlink_scaled_to_pwm(scaled_value, cfg);
+}
+
+fn mavlink_scaled_to_pwm(input: i16, cfg: &ChannelConfig) -> u16 {
+    if input == i16::MAX {
         return cfg.neutral;
     }
-    if input > 0 {
+
+    let input = input.clamp(-10000, 10000);
+    if input >= 0 {
         let range = (cfg.max - cfg.neutral) as f32;
-        return cfg.neutral + ((input as f32 / 1000.0) * range).round() as u16;
+        return cfg.neutral + ((input as f32 / 10000.0) * range).round() as u16;
     }
     let range = (cfg.neutral - cfg.min) as f32;
-    cfg.neutral - (((-input) as f32 / 1000.0) * range).round() as u16
+    cfg.neutral - (((-input) as f32 / 10000.0) * range).round() as u16
 }
+
 
 fn translate_message(msg: MavMessage, state: &AppConfig) -> Vec<AbsoluteControlOutput> {
     let mut outputs: Vec<AbsoluteControlOutput> = Vec::new();
@@ -321,14 +316,14 @@ fn translate_message(msg: MavMessage, state: &AppConfig) -> Vec<AbsoluteControlO
             if let Some(throttle_cfg) = throttle_channel_config {
                 outputs.push(AbsoluteControlOutput {
                     channel: throttle_cfg.pwm_channel,
-                    value: mavlink_to_pwm(data.x, &throttle_cfg),
+                    value: mavlink_scaled_to_pwm(data.x, &throttle_cfg),
                 });
             }
             if let Some(steering_cfg) = steering_channel_config {
                 let steering = if data.y != 0 {
-                    mavlink_to_pwm(data.y, &steering_cfg)
+                    mavlink_scaled_to_pwm(data.y, &steering_cfg)
                 } else {
-                    mavlink_to_pwm(data.r, &steering_cfg)
+                    mavlink_scaled_to_pwm(data.r, &steering_cfg)
                 };
                 outputs.push(AbsoluteControlOutput {
                     channel: steering_cfg.pwm_channel,
@@ -343,7 +338,7 @@ fn translate_message(msg: MavMessage, state: &AppConfig) -> Vec<AbsoluteControlO
                 data.chan5_raw, data.chan6_raw, data.chan7_raw, data.chan8_raw,
             ];
             for i in 0..channels.len() {
-                if channels[i] == 0 || channels[i] == 65535 {
+                if channels[i] == 0 || channels[i] == u16::MAX {
                     continue;
                 }
                 let channel_config: Option<&ChannelConfig> = state
@@ -351,12 +346,10 @@ fn translate_message(msg: MavMessage, state: &AppConfig) -> Vec<AbsoluteControlO
                     .iter()
                     .find(|cfg| cfg.map_or(false, |c| c.mavlink_channel as usize == i + 1))
                     .and_then(|cfg| cfg.as_ref());
-                let ichan: i16 =
-                    (channels[i] as i32 - 1500).clamp(-1000, 1000) as i16;
                 if let Some(cfg) = channel_config {
                     outputs.push(AbsoluteControlOutput {
                         channel: cfg.pwm_channel,
-                        value: mavlink_to_pwm(ichan, cfg),
+                        value: mavlink_raw_to_pwm(channels[i], cfg),
                     });
                 }
             }
@@ -367,8 +360,8 @@ fn translate_message(msg: MavMessage, state: &AppConfig) -> Vec<AbsoluteControlO
                 if let Some(throttle_cfg) = throttle_channel_config {
                     outputs.push(AbsoluteControlOutput {
                         channel: throttle_cfg.pwm_channel,
-                        value: mavlink_to_pwm(
-                            (data.controls[3] * 1000.0) as i16,
+                        value: mavlink_scaled_to_pwm(
+                            (data.controls[3] * 10000.0) as i16,
                             &throttle_cfg,
                         ),
                     });
@@ -376,8 +369,8 @@ fn translate_message(msg: MavMessage, state: &AppConfig) -> Vec<AbsoluteControlO
                 if let Some(steering_cfg) = steering_channel_config {
                     outputs.push(AbsoluteControlOutput {
                         channel: steering_cfg.pwm_channel,
-                        value: mavlink_to_pwm(
-                            (data.controls[0] * 1000.0) as i16,
+                        value: mavlink_scaled_to_pwm(
+                            (data.controls[0] * 10000.0) as i16,
                             &steering_cfg,
                         ),
                     });
@@ -392,73 +385,9 @@ fn translate_message(msg: MavMessage, state: &AppConfig) -> Vec<AbsoluteControlO
     outputs
 }
 
-// ── Keyboard thread ───────────────────────────────────────────────────────────
-
-/// Spawn a thread that translates crossterm key events into `KeyCommand`s and
-/// forwards them over `tx`.  The thread exits when `tx` is dropped (i.e. when
-/// the main loop returns), or when the user presses Q / Ctrl-C.
-fn spawn_keyboard_thread(tx: mpsc::Sender<KeyCommand>) {
-    thread::spawn(move || {
-        loop {
-            // poll with a short timeout so we don't block forever if tx dies
-            match event::poll(Duration::from_millis(50)) {
-                Ok(true) => {}
-                Ok(false) => continue,
-                Err(_) => break,
-            }
-
-            let ev = match event::read() {
-                Ok(e) => e,
-                Err(_) => break,
-            };
-
-            let cmd = match ev {
-                Event::Key(KeyEvent { code, modifiers, .. }) => match code {
-                    KeyCode::Up    => Some(KeyCommand::ThrottleUp),
-                    KeyCode::Down  => Some(KeyCommand::ThrottleDown),
-                    KeyCode::Left  => Some(KeyCommand::SteerLeft),
-                    KeyCode::Right => Some(KeyCommand::SteerRight),
-                    KeyCode::Char(' ') => Some(KeyCommand::Neutral),
-                    KeyCode::Char('q') | KeyCode::Char('Q') => Some(KeyCommand::Quit),
-                    KeyCode::Char('c')
-                        if modifiers.contains(KeyModifiers::CONTROL) =>
-                    {
-                        Some(KeyCommand::Quit)
-                    }
-                    _ => None,
-                },
-                _ => None,
-            };
-
-            if let Some(cmd) = cmd {
-                if tx.send(cmd).is_err() {
-                    break; // main loop has exited
-                }
-            }
-        }
-    });
-}
-
-// ── Apply a KeyCommand to AppConfig ──────────────────────────────────────────
-
 /// Clamp a PWM value inside the channel's [min, max] range.
 fn clamp_to_channel(value: i32, cfg: &ChannelConfig) -> u16 {
     value.clamp(cfg.min as i32, cfg.max as i32) as u16
-}
-
-/// Apply one keyboard step to a single channel index, returning whether the
-/// channel existed.
-fn apply_key_step(state: &mut AppConfig, channel_idx: u8, delta: i32) -> bool {
-    if let Some(cfg) = &mut state.channel[channel_idx as usize] {
-        let next = clamp_to_channel(cfg.current_value as i32 + delta, cfg);
-        if next != cfg.current_value {
-            cfg.current_value = next;
-            cfg.changed = true;
-        }
-        true
-    } else {
-        false
-    }
 }
 
 /// Reset a single channel to neutral.
@@ -469,6 +398,14 @@ fn reset_channel(state: &mut AppConfig, channel_idx: u8) {
     }
 }
 
+fn slew(current: u16, target: u16, max_step: u16) -> u16 {
+    if target > current {
+        (current + max_step).min(target)
+    } else {
+        (current - max_step).max(target)
+    }    
+}
+
 // ── Main loop ─────────────────────────────────────────────────────────────────
 
 const MESSAGE_TIMEOUT: Duration = Duration::from_millis(500);
@@ -476,7 +413,6 @@ const MESSAGE_TIMEOUT: Duration = Duration::from_millis(500);
 /// Combined event for the main select loop.
 enum LoopEvent {
     Mav(MavMessage),
-    Key(KeyCommand),
 }
 
 fn run_loop(
@@ -484,17 +420,13 @@ fn run_loop(
     state: &mut AppConfig,
     mavlink_service: MavLinkService,
 ) -> Result<()> {
-    // Two channels funnelled into one via LoopEvent
+    // Control channels funnelled into one via LoopEvent
     let (mav_tx, mav_rx) = mpsc::channel::<MavMessage>();
-    let (key_tx, key_rx) = mpsc::channel::<KeyCommand>();
 
     let mut time_since_last_heartbeat = Instant::now();
     let mut time_since_last_message: Option<Instant> = None;
     let mut watchdog_triggered = false;
-    let mut quit_requested = false;
-
-    // Spawn the keyboard listener
-    spawn_keyboard_thread(key_tx);
+    let mut time_since_last_update: Instant = Instant::now();
 
     thread::scope(|s| {
         // MAVLink receiver thread
@@ -519,6 +451,20 @@ fn run_loop(
 
         // Main control loop
         loop {
+
+            let elapsed = time_since_last_update.elapsed();
+            let should_update_hw = elapsed >= CONTROL_LOOP_MIN_DURATION;
+
+            if should_update_hw {
+                time_since_last_update = Instant::now();
+            }
+
+            let poll_timeout = if should_update_hw {
+                Duration::from_millis(0)
+            } else {
+                CONTROL_LOOP_MIN_DURATION - elapsed
+            };
+
             // ── Heartbeat ────────────────────────────────────────────────────
             if time_since_last_heartbeat.elapsed() > HEARTBEAT_DURATION {
                 mavlink_service.send_heart_beat()?;
@@ -541,11 +487,6 @@ fn run_loop(
                 }
             }
 
-            // ── Collect events (MAVLink + keyboard) ───────────────────────
-            // Use a short timeout so both queues are drained quickly and the
-            // heartbeat & watchdog timers stay responsive.
-            let poll_timeout = Duration::from_millis(20);
-
             let mut events: Vec<LoopEvent> = Vec::new();
 
             // Drain all pending MAVLink messages
@@ -562,16 +503,7 @@ fn run_loop(
                 // Only block on the very first recv; drain the rest instantly
             }
 
-            // Drain all pending keyboard events
-            loop {
-                match key_rx.try_recv() {
-                    Ok(cmd) => events.push(LoopEvent::Key(cmd)),
-                    Err(mpsc::TryRecvError::Empty) => break,
-                    Err(mpsc::TryRecvError::Disconnected) => break,
-                }
-            }
-
-            // ── Process events ────────────────────────────────────────────
+            // ── Process events ─────────────────────────────────────────────
             for ev in events {
                 match ev {
                     LoopEvent::Mav(msg) => {
@@ -581,54 +513,21 @@ fn run_loop(
                             for c in 0..NUMBER_OF_CHANNELS {
                                 if let Some(cfg) = &mut state.channel[c] {
                                     if cfg.pwm_channel == command.channel {
-                                        cfg.current_value = command.value;
+                                        cfg.current_value = slew(cfg.current_value, command.value, cfg.max_step);
                                         cfg.changed = true;
                                         break;
                                     }
                                 }
                             }
                         }
-                        driver.apply(state)?;
-                    }
-
-                    LoopEvent::Key(cmd) => {
-                        match cmd {
-                            KeyCommand::Quit => {
-                                quit_requested = true;
-                            }
-                            KeyCommand::Neutral => {
-                                driver.safe_stop(state)?;
-                                // Reset in-memory state to neutral too
-                                reset_channel(state, state.controls.throttle);
-                                reset_channel(state, state.controls.steering);
-                            }
-                            KeyCommand::ThrottleUp => {
-                                apply_key_step(state, state.controls.throttle, KEY_STEP);
-                                driver.apply(state)?;
-                            }
-                            KeyCommand::ThrottleDown => {
-                                apply_key_step(state, state.controls.throttle, -KEY_STEP);
-                                driver.apply(state)?;
-                            }
-                            KeyCommand::SteerLeft => {
-                                apply_key_step(state, state.controls.steering, -KEY_STEP);
-                                driver.apply(state)?;
-                            }
-                            KeyCommand::SteerRight => {
-                                apply_key_step(state, state.controls.steering, KEY_STEP);
-                                driver.apply(state)?;
-                            }
-                        }
                     }
                 }
             }
 
-            if quit_requested {
-                driver.safe_stop(state)?;
-                break;
+            // Apply hardware updates only when the minimum interval has elapsed
+            if should_update_hw {
+                driver.apply(state)?;
             }
-
-            render_ui(state, watchdog_triggered)?;
         }
 
         Ok(())
@@ -651,15 +550,10 @@ fn main() -> Result<()> {
     let mav = MavLinkService::new(&state)?;
 
     arm_esc(&mut driver, &state)?;
-    enable_raw_mode().context("Failed to enable raw terminal mode")?;
-    execute!(io::stdout(), cursor::Hide)?;
-    render_ui(&state, false)?;
 
     let result = run_loop(&mut driver, &mut state, mav);
 
-    let _ = disable_raw_mode();
-    let _ = execute!(io::stdout(), cursor::Show);
-    driver.safe_stop(&state)?;
+    driver.safe_stop(&mut state)?;
     println!("\nRC robo controller stopped. Goodbye!");
     result
 }
