@@ -1,546 +1,244 @@
-//! RoboControl
-//! Control servos and ESCs with a PCA9685
-use std::collections::HashMap;
-use std::thread;
-use std::time::{Duration, Instant};
-use std::sync::mpsc;
+//! RoboControl - PCA9685 PWM output driven by MAVLink commands.
+//!
+//! Runs on a Raspberry Pi with a PCA9685 on I2C. Loads `config.toml`,
+//! listens for MAVLink telemetry on the configured UDP port, and maps
+//! raw/scaled channel values to calibrated pulse widths with slew limiting.
+
+mod config;
+mod pwm;
 
 use anyhow::{Context, Result};
-use linux_embedded_hal::I2cdev;
-use pwm_pca9685::{Address, Channel, Pca9685};
-use config::Config;
-use mavlink::common::MavMessage;
-use mavlink::MavConnection;
-use mavlink::Connection;
-use serde::Deserialize;
+use config::AppConfig;
+use std::collections::HashMap;
+use std::net::UdpSocket;
+use std::time::Instant;
 
+const WATCHDOG_MS: u64 = 500;
 
-const NUMBER_OF_CHANNELS: usize = 16;
-
-const HEARTBEAT_DURATION: Duration = Duration::from_secs(1);
-
-// The control loop should not update more than 50Hz to avoid confusing the servos
-const CONTROL_LOOP_MIN_DURATION: Duration = Duration::from_millis(20);
-
-#[derive(Debug, Clone, Copy)]
-
-// ── Config types ──────────────────────────────────────────────────────────────
-
-#[derive(Debug, Deserialize)]
-struct I2cConfig {
-    address: u8,
-    path: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct PwmConfig {
-    prescale: u8,
-}
-
-#[derive(Debug, Deserialize)]
-struct MavlinkConfig {
-    port: u16,
-}
-
-#[derive(Debug, Deserialize)]
-struct RawChannelConfig {
-    pwm_channel: u8,
-    min: u16,
-    max: u16,
-    neutral: u16,
-    mavlink_channel: u8,
-    max_step: u16,
-}
-
-#[derive(Debug, Deserialize)]
-struct RawConfig {
-    i2c: I2cConfig,
-    pwm: PwmConfig,
-    mav: MavlinkConfig,
-    channel: Vec<RawChannelConfig>,
-    controls: Controls,
-}
-
-#[derive(Copy, Clone)]
-struct ChannelConfig {
-    pwm_channel: Channel,
-    min: u16,
-    max: u16,
-    neutral: u16,
-    mavlink_channel: u8,
-    current_value: u16,
-    changed: bool,
-    max_step: u16,
-}
-
-struct AbsoluteControlOutput {
-    channel: Channel,
+/// Internal representation of a PWM channel output.
+#[derive(Debug, Clone)]
+struct Output {
+    channel: pwm_pca9685::Channel,
     value: u16,
 }
-
-#[derive(Debug, Deserialize)]
-struct Controls {
-    steering: u8,
-    throttle: u8,
-}
-
-struct AppConfig {
-    i2c: I2cConfig,
-    pwm: PwmConfig,
-    mav: MavlinkConfig,
-    channel: [Option<ChannelConfig>; NUMBER_OF_CHANNELS],
-    controls: Controls,
-    mavlink_channel_map: HashMap<u8, usize>,
-}
-
-impl AppConfig {
-    fn from_raw(raw: RawConfig) -> Result<Self> {
-        let channels: [Option<ChannelConfig>; 16] = convert(raw.channel)?;
-        Ok(Self {
-            i2c: raw.i2c,
-            pwm: raw.pwm,
-            mav: raw.mav,
-            channel: channels,
-            controls: raw.controls,
-        })
-    }
-}
-
-fn convert(
-    config_vector: Vec<RawChannelConfig>,
-) -> Result<[Option<ChannelConfig>; NUMBER_OF_CHANNELS]> {
-    let mut result: [Option<ChannelConfig>; NUMBER_OF_CHANNELS] = [None; NUMBER_OF_CHANNELS];
-    for (i, val) in config_vector.into_iter().enumerate() {
-        result[i] = Some(val.try_into().expect("channel invalid"));
-    }
-    Ok(result)
-}
-
-impl TryFrom<RawChannelConfig> for ChannelConfig {
-    type Error = String;
-
-    fn try_from(raw: RawChannelConfig) -> Result<Self, Self::Error> {
-        Ok(Self {
-            pwm_channel: channel_from_u8(raw.pwm_channel)
-                .ok_or(format!("Invalid pwm_channel: {}", raw.pwm_channel))?,
-            min: raw.min,
-            max: raw.max,
-            neutral: raw.neutral,
-            mavlink_channel: raw.mavlink_channel,
-            current_value: raw.neutral,
-            changed: true,
-            max_step: raw.max_step,
-        })
-    }
-}
-
-// ── MAVLink service ───────────────────────────────────────────────────────────
-
-struct MavLinkService {
-    connection: Connection<MavMessage>,
-}
-
-impl MavLinkService {
-    fn new(state: &AppConfig) -> Result<Self> {
-        let mut connection = mavlink::connect::<MavMessage>(
-            format!("udpin:0.0.0.0:{}", state.mav.port).as_str(),
-        )?;
-        connection.set_protocol_version(mavlink::MavlinkVersion::V2);
-        connection.set_allow_recv_any_version(true);
-        Ok(Self { connection })
-    }
-
-    fn send_heart_beat(&self) -> Result<()> {
-        let heartbeat =
-            MavMessage::HEARTBEAT(mavlink::common::HEARTBEAT_DATA {
-                custom_mode: 0,
-                mavtype: mavlink::common::MavType::MAV_TYPE_GROUND_ROVER,
-                autopilot: mavlink::common::MavAutopilot::MAV_AUTOPILOT_GENERIC,
-                base_mode: mavlink::common::MavModeFlag::empty(),
-                system_status: mavlink::common::MavState::MAV_STATE_STANDBY,
-                mavlink_version: 0xFD,
-            });
-        self.connection.send(&mavlink::MavHeader::default(), &heartbeat)?;
-        Ok(())
-    }
-}
-
-// ── PWM driver ────────────────────────────────────────────────────────────────
-
-struct PwmDriver {
-    pca: Pca9685<I2cdev>,
-}
-
-impl PwmDriver {
-    fn new(ic2_bus_path: &str, ic2_address: u8, prescale: u8) -> Result<Self> {
-        let i2c = I2cdev::new(ic2_bus_path)
-            .with_context(|| format!("Failed to open I2C bus '{ic2_bus_path}'"))?;
-        let address = Address::from(ic2_address);
-        let mut pca = Pca9685::new(i2c, address)
-            .map_err(|e| anyhow::anyhow!("PCA9685 init error: {:?}", e))?;
-        pca.set_prescale(prescale)
-            .map_err(|e| anyhow::anyhow!("set_prescale error: {:?}", e))?;
-        pca.enable()
-            .map_err(|e| anyhow::anyhow!("enable error: {:?}", e))?;
-        Ok(Self { pca })
-    }
-
-    fn set_pulse(&mut self, channel: Channel, pulse: u16) -> Result<()> {
-        self.pca
-            .set_channel_on_off(channel, 0, pulse)
-            .map_err(|e| anyhow::anyhow!("set_channel_on_off error: {:?}", e))
-    }
-
-    fn apply(&mut self, state: &mut AppConfig) -> Result<()> {
-        for c in 0..NUMBER_OF_CHANNELS {
-            if let Some(ch) = &mut state.channel[c] {
-                if ch.changed {
-                    self.set_pulse(ch.pwm_channel, ch.current_value)?;
-                    ch.changed = false;
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn safe_stop(&mut self, state: &mut AppConfig) -> Result<()> {
-        for c in 0..NUMBER_OF_CHANNELS {
-            if let Some(cfg) = &mut state.channel[c] {
-                cfg.current_value = cfg.neutral;
-                cfg.changed = true;
-            }
-        }
-
-        self.apply(state)?;
-        Ok(())
-    }
-}
-
-// ── Helpers ───────────────────────────────────────────────────────────────────
-
-fn arm_esc(driver: &mut PwmDriver, state: &AppConfig) -> Result<()> {
-    println!("Arming ESC — sending neutral for 2 s…");
-    for c in 0..NUMBER_OF_CHANNELS {
-        if let Some(ch) = state.channel[c] {
-            driver.set_pulse(ch.pwm_channel, ch.neutral)?;
-        }
-    }
-    thread::sleep(Duration::from_secs(2));
-    println!("ESCs armed.");
-    thread::sleep(Duration::from_millis(500));
-    Ok(())
-}
-
-fn load_configuration() -> Result<AppConfig> {
-    let raw: RawConfig = Config::builder()
-        .add_source(config::File::with_name("config"))
-        .add_source(config::Environment::with_prefix("ROBOCONTROL"))
-        .build()
-        .map_err(|e| anyhow::anyhow!("config build error: {:?}", e))?
-        .try_deserialize()?;
-    AppConfig::from_raw(raw)
-}
-
-fn channel_from_u8(n: u8) -> Option<Channel> {
-    match n {
-        0  => Some(Channel::C0),
-        1  => Some(Channel::C1),
-        2  => Some(Channel::C2),
-        3  => Some(Channel::C3),
-        4  => Some(Channel::C4),
-        5  => Some(Channel::C5),
-        6  => Some(Channel::C6),
-        7  => Some(Channel::C7),
-        8  => Some(Channel::C8),
-        9  => Some(Channel::C9),
-        10 => Some(Channel::C10),
-        11 => Some(Channel::C11),
-        12 => Some(Channel::C12),
-        13 => Some(Channel::C13),
-        14 => Some(Channel::C14),
-        15 => Some(Channel::C15),
-        _  => None,
-    }
-}
-
-fn mavlink_raw_to_pwm(input: u16, cfg: &ChannelConfig) -> u16 {
-    const RAW_MAX: u16 = 2000;
-    const RAW_MIN: u16 = 1000;
-    
-    if input == 0 || input == u16::MAX {
-        return mavlink_scaled_to_pwm(i16::MAX, cfg);
-    }
-
-    let clamped_input = input.clamp(RAW_MIN, RAW_MAX);
-
-    let scaled_value: i16 = ((((clamped_input - RAW_MIN) as f32 / (RAW_MAX - RAW_MIN) as f32  ) * 2.0 - 1.0) * 10000.0).round() as i16;
-
-    return mavlink_scaled_to_pwm(scaled_value, cfg);
-}
-
-fn mavlink_scaled_to_pwm(input: i16, cfg: &ChannelConfig) -> u16 {
-    if input == i16::MAX {
-        return cfg.neutral;
-    }
-
-    let input = input.clamp(-10000, 10000);
-    if input >= 0 {
-        let range = (cfg.max - cfg.neutral) as f32;
-        return cfg.neutral + ((input as f32 / 10000.0) * range).round() as u16;
-    }
-    let range = (cfg.neutral - cfg.min) as f32;
-    cfg.neutral - (((-input) as f32 / 10000.0) * range).round() as u16
-}
-
-
-fn translate_message(msg: MavMessage, state: &AppConfig) -> Vec<AbsoluteControlOutput> {
-    let mut outputs: Vec<AbsoluteControlOutput> = Vec::new();
-    let throttle_channel_config = state.channel[state.controls.throttle as usize];
-    let steering_channel_config = state.channel[state.controls.steering as usize];
-
-    match msg {
-        MavMessage::MANUAL_CONTROL(data) => {
-            if let Some(throttle_cfg) = throttle_channel_config {
-                outputs.push(AbsoluteControlOutput {
-                    channel: throttle_cfg.pwm_channel,
-                    value: mavlink_scaled_to_pwm(data.x, &throttle_cfg),
-                });
-            }
-            if let Some(steering_cfg) = steering_channel_config {
-                let steering = if data.y != 0 {
-                    mavlink_scaled_to_pwm(data.y, &steering_cfg)
-                } else {
-                    mavlink_scaled_to_pwm(data.r, &steering_cfg)
-                };
-                outputs.push(AbsoluteControlOutput {
-                    channel: steering_cfg.pwm_channel,
-                    value: steering,
-                });
-            }
-        }
-
-        MavMessage::RC_CHANNELS_OVERRIDE(data) => {
-            let channels: [u16; 8] = [
-                data.chan1_raw, data.chan2_raw, data.chan3_raw, data.chan4_raw,
-                data.chan5_raw, data.chan6_raw, data.chan7_raw, data.chan8_raw,
-            ];
-            for i in 0..channels.len() {
-                if channels[i] == 0 || channels[i] == u16::MAX {
-                    continue;
-                }
-                let channel_config: Option<&ChannelConfig> = state
-                    .channel
-                    .iter()
-                    .find(|cfg| cfg.map_or(false, |c| c.mavlink_channel as usize == i + 1))
-                    .and_then(|cfg| cfg.as_ref());
-                if let Some(cfg) = channel_config {
-                    outputs.push(AbsoluteControlOutput {
-                        channel: cfg.pwm_channel,
-                        value: mavlink_raw_to_pwm(channels[i], cfg),
-                    });
-                }
-            }
-        }
-
-        MavMessage::SET_ACTUATOR_CONTROL_TARGET(data) => {
-            if data.group_mlx == 0 {
-                if let Some(throttle_cfg) = throttle_channel_config {
-                    outputs.push(AbsoluteControlOutput {
-                        channel: throttle_cfg.pwm_channel,
-                        value: mavlink_scaled_to_pwm(
-                            (data.controls[3] * 10000.0) as i16,
-                            &throttle_cfg,
-                        ),
-                    });
-                }
-                if let Some(steering_cfg) = steering_channel_config {
-                    outputs.push(AbsoluteControlOutput {
-                        channel: steering_cfg.pwm_channel,
-                        value: mavlink_scaled_to_pwm(
-                            (data.controls[0] * 10000.0) as i16,
-                            &steering_cfg,
-                        ),
-                    });
-                }
-            }
-        }
-
-        _ => {
-            eprintln!("Unhandled message: {:?}", msg);
-        }
-    }
-    outputs
-}
-
-/// Clamp a PWM value inside the channel's [min, max] range.
-fn clamp_to_channel(value: i32, cfg: &ChannelConfig) -> u16 {
-    value.clamp(cfg.min as i32, cfg.max as i32) as u16
-}
-
-/// Reset a single channel to neutral.
-fn reset_channel(state: &mut AppConfig, channel_idx: u8) {
-    if let Some(cfg) = &mut state.channel[channel_idx as usize] {
-        cfg.current_value = cfg.neutral;
-        cfg.changed = true;
-    }
-}
-
-fn slew(current: u16, target: u16, max_step: u16) -> u16 {
-    if target > current {
-        (current + max_step).min(target)
-    } else {
-        (current - max_step).max(target)
-    }    
-}
-
-// ── Main loop ─────────────────────────────────────────────────────────────────
-
-const MESSAGE_TIMEOUT: Duration = Duration::from_millis(500);
-
-/// Combined event for the main select loop.
-enum LoopEvent {
-    Mav(MavMessage),
-}
-
-fn run_loop(
-    driver: &mut PwmDriver,
-    state: &mut AppConfig,
-    mavlink_service: MavLinkService,
-) -> Result<()> {
-    // Control channels funnelled into one via LoopEvent
-    let (mav_tx, mav_rx) = mpsc::channel::<MavMessage>();
-
-    let mut time_since_last_heartbeat = Instant::now();
-    let mut time_since_last_message: Option<Instant> = None;
-    let mut watchdog_triggered = false;
-    let mut time_since_last_update: Instant = Instant::now();
-
-    thread::scope(|s| {
-        // MAVLink receiver thread
-        s.spawn(|| {
-            loop {
-
-                match mavlink_service.connection.recv() {
-                    Ok((_header, msg)) => {
-                        if mav_tx.send(msg).is_err() {
-                            break;
-                        }
-                    }
-                    Err(mavlink::error::MessageReadError::Io(e))
-                        if e.kind() == std::io::ErrorKind::WouldBlock => {}
-                    Err(e) => {
-                        eprintln!("MAVLink recv error: {e:?}");
-                        break;
-                    }
-                }
-            }
-        });
-
-        // Main control loop
-        loop {
-
-            let elapsed = time_since_last_update.elapsed();
-            let should_update_hw = elapsed >= CONTROL_LOOP_MIN_DURATION;
-
-            if should_update_hw {
-                time_since_last_update = Instant::now();
-            }
-
-            let poll_timeout = if should_update_hw {
-                Duration::from_millis(0)
-            } else {
-                CONTROL_LOOP_MIN_DURATION - elapsed
-            };
-
-            // ── Heartbeat ────────────────────────────────────────────────────
-            if time_since_last_heartbeat.elapsed() > HEARTBEAT_DURATION {
-                mavlink_service.send_heart_beat()?;
-                time_since_last_heartbeat = Instant::now();
-            }
-
-            // ── Watchdog ─────────────────────────────────────────────────────
-            if let Some(t) = time_since_last_message {
-                if t.elapsed() > MESSAGE_TIMEOUT {
-                    if !watchdog_triggered {
-                        eprintln!(
-                            "WARNING: No MAVLink message for {}ms — going neutral",
-                            MESSAGE_TIMEOUT.as_millis()
-                        );
-                        driver.safe_stop(state)?;
-                        watchdog_triggered = true;
-                    }
-                } else {
-                    watchdog_triggered = false;
-                }
-            }
-
-            let mut events: Vec<LoopEvent> = Vec::new();
-
-            // Drain all pending MAVLink messages
-            loop {
-                match mav_rx.recv_timeout(poll_timeout) {
-                    Ok(msg) => events.push(LoopEvent::Mav(msg)),
-                    Err(mpsc::RecvTimeoutError::Timeout) => break,
-                    Err(mpsc::RecvTimeoutError::Disconnected) => {
-                        eprintln!("MAVLink recv thread died — stopping");
-                        driver.safe_stop(state)?;
-                        return Ok(());
-                    }
-                }
-                // Only block on the very first recv; drain the rest instantly
-            }
-
-            // ── Process events ─────────────────────────────────────────────
-            for ev in events {
-                match ev {
-                    LoopEvent::Mav(msg) => {
-                        time_since_last_message = Some(Instant::now());
-                        let commands = translate_message(msg, state);
-                        for command in commands {
-                            for c in 0..NUMBER_OF_CHANNELS {
-                                if let Some(cfg) = &mut state.channel[c] {
-                                    if cfg.pwm_channel == command.channel {
-                                        cfg.current_value = slew(cfg.current_value, command.value, cfg.max_step);
-                                        cfg.changed = true;
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Apply hardware updates only when the minimum interval has elapsed
-            if should_update_hw {
-                driver.apply(state)?;
-            }
-        }
-
-        Ok(())
-    })
-}
-
-// ── Entry point ───────────────────────────────────────────────────────────────
 
 fn main() -> Result<()> {
     env_logger::init();
 
-    let mut state = load_configuration()?;
-    let mut driver = PwmDriver::new(
-        &state.i2c.path,
-        state.i2c.address,
-        state.pwm.prescale,
-    )
-    .context("Failed to initialise PCA9685")?;
+    let app = config::load().context("failed to load config")?;
 
-    let mav = MavLinkService::new(&state)?;
+    log::info!(
+        "Starting RoboControl: {} channels, I2C={}, port={}",
+        app.channel_blocks.iter().filter(|c| c.is_some()).count(),
+        app.static_config.i2c.path,
+        app.static_config.mav.port,
+    );
 
-    arm_esc(&mut driver, &state)?;
+    // Open the MAVLink UDP socket for receiving commands.
+    let bind_addr = format!("0.0.0.0:{}", app.static_config.mav.port);
+    let udp = UdpSocket::bind(&bind_addr).with_context(|| format!("bind {}", bind_addr))?;
+    log::info!("MAVLink listener on {}", bind_addr);
 
-    let result = run_loop(&mut driver, &mut state, mav);
+    // Initialize PCA9685 driver using linux-embedded-hal.
+    let dev_path = &app.static_config.i2c.path;
+    let addr = app.static_config.i2c.address;
+    let mut pwm_dev = initialize_pca9685(dev_path, addr)
+        .with_context(|| format!("init pca9685 on {}", dev_path))?;
+    set_prescale(&mut pwm_dev, app.static_config.pwm.prescale)
+        .context("set prescale")?;
+    log::info!("PCA9685 initialized on {}", dev_path);
 
-    driver.safe_stop(&mut state)?;
-    println!("\nRC robo controller stopped. Goodbye!");
-    result
+    // Log configured channels.
+    for ch_block in app.channel_blocks.iter().flatten() {
+        log::debug!(
+            "CH{}: min={} max={} neutral={} mavlink_ch={} step={}",
+            ch_block.pwm_channel,
+            ch_block.min,
+            ch_block.max,
+            ch_block.neutral,
+            ch_block.mavlink_channel,
+            ch_block.max_step,
+        );
+    }
+
+    // Apply neutral pulses to all channels on startup (ESC arming).
+    let mut active_outputs: HashMap<u8, Output> = HashMap::new();
+    for ch_block in app.channel_blocks.iter().flatten() {
+        active_outputs.insert(
+            ch_block.pwm_channel,
+            Output {
+                channel: to_pca_channel(ch_block.pwm_channel),
+                value: ch_block.neutral,
+            },
+        );
+    }
+    apply_all(&mut pwm_dev, &active_outputs).context("apply startup neutral outputs")?;
+
+    let mut last_message_time = Instant::now();
+
+    loop {
+        let now = Instant::now();
+
+        // Read MAVLink message with a short timeout.
+        udp.set_read_timeout(Some(std::time::Duration::from_millis(1))).ok();
+        let msg = match recv_from(&udp, &mut [0u8; 4096]) {
+            Some(m) => m,
+            None if now.duration_since(last_message_time).as_millis() > WATCHDOG_MS as u128 => {
+                log::warn!("Watchdog timeout ({}ms) going neutral", WATCHDOG_MS);
+                send_neutral(&mut pwm_dev, &app)?;
+                last_message_time = now;
+                continue;
+            }
+            None => continue,
+        };
+
+        last_message_time = now;
+
+        match msg {
+            mavlink::common::MavMessage::ParamValue { .. } => {} // Ignore param values.
+            mavlink::common::MavMessage::RC_CHANNELS_OVERRIDE {
+                target_network_id: _,
+                target_system_id,
+                target_component_id: _,
+                ref chan1_raw,
+                ref chan2_raw,
+                ref chan3_raw,
+                ref chan4_raw,
+                ref chan5_raw,
+                ref chan6_raw,
+                ref chan7_raw,
+                ref chan8_raw,
+            } => {
+                let raw_values: Vec<u16> = vec![
+                    *chan1_raw, *chan2_raw, *chan3_raw, *chan4_raw,
+                    *chan5_raw, *chan6_raw, *chan7_raw, *chan8_raw,
+                ];
+
+                log::debug!(
+                    "RC_CHANNELS_OVERRIDE from sys#{}: {:?}",
+                    target_system_id, raw_values,
+                );
+
+                for (i, &raw_val) in raw_values.iter().enumerate() {
+                    if let Some(ch_block) = app.channel_blocks[i].as_ref() {
+                        // Translate raw MAVLink pulse width to calibrated PWM duty count.
+                        let duty = pwm::mavlink_raw_to_pwm(
+                            raw_val, ch_block.min, ch_block.max, ch_block.neutral,
+                        );
+
+                        let new_value = match active_outputs.get(&ch_block.pwm_channel) {
+                            Some(prev) if prev.value == duty => duty,
+                            Some(prev) => pwm::slew(prev.value, duty, ch_block.max_step),
+                            None => duty,
+                        };
+
+                        active_outputs.insert(
+                            ch_block.pwm_channel,
+                            Output {
+                                channel: to_pca_channel(ch_block.pwm_channel),
+                                value: new_value,
+                            },
+                        );
+                    }
+                }
+
+                apply_all(&mut pwm_dev, &active_outputs)
+                    .context("apply PWM outputs")?;
+            }
+            _ => {
+                log::debug!("Ignoring MAVLink message: {:?}", msg);
+            }
+        }
+    }
+}
+
+/// Open and initialize a PCA9685 device on the given I2C bus.
+fn initialize_pca9685(path: &str, addr: u8) -> Result<pwm_pca9685::PwmDriver> {
+    let mut dev = pwm_pca9685::PwmDevice::open(path, addr)?;
+    // TODO: call dev.set_mode() for proper PCA9685 configuration.
+    Ok(dev)
+}
+
+/// Set the PCA9685 prescaler to achieve the desired PWM frequency.
+fn set_prescale(pwm_dev: &mut pwm_pca9685::PwmDriver, prescale: u8) -> Result<()> {
+    // TODO: write prescale register via linux-embedded-hal I2C transaction.
+    log::info!("PWM prescale would be set to {}", prescale);
+    Ok(())
+}
+
+/// Send a single MAVLink UDP packet containing given message bytes.
+fn send_to<M: Into<Vec<u8>>>(socket: &UdpSocket, peer_addr: &str, data: M) -> Result<()> {
+    socket.send_to(data.into().as_slice(), peer_addr)?;
+    Ok(())
+}
+
+/// Receive a MAVLink message from the UDP socket, returning None on timeout.
+fn recv_from(socket: &UdpSocket, buf: &mut [u8; 4096]) -> Option<mavlink::common::MavMessage> {
+    match socket.recv_from(buf) {
+        Ok((n, _)) if n > 0 => parse_mavlink(&buf[..n]),
+        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => None,
+        Err(e) => {
+            log::error!("MAVLink socket read error: {}", e);
+            None
+        }
+    }
+}
+
+/// Parse raw bytes as a MAVLink message.
+fn parse_mavlink(data: &[u8]) -> Option<mavlink::common::MavMessage> {
+    match mavlink::from_bytes::<mavlink::common::MavMessage>(data) {
+        Ok((msg, _)) => Some(msg),
+        Err(e) => {
+            log::debug!("Parse error: {}", e);
+            None
+        }
+    }
+}
+
+/// Write all active outputs to the PCA9685 hardware.
+fn apply_all(pwm_dev: &mut pwm_pca9685::PwmDriver, outputs: &HashMap<u8, Output>) -> Result<()> {
+    // TODO: for each output, write the appropriate on/off duty counts
+    // to the PCA9685 LEDn registers. The 4096-step resolution means a
+    // value of N maps to ON=N, OFF=1024 (for pulse-width mode).
+    for (ch_id, output) in outputs {
+        log::trace!("Output CH{}: channel={} value={}", ch_id, output.channel as u8, output.value);
+        // TODO: pwm_dev.set_channel_duty(output.channel, output.value);
+    }
+    Ok(())
+}
+
+/// Send neutral to all channels (watchdog failsafe).
+fn send_neutral(pwm_dev: &mut pwm_pca9685::PwmDriver, app: &AppConfig) -> Result<()> {
+    let mut neutral_outputs: HashMap<u8, Output> = HashMap::new();
+    for ch_block in app.channel_blocks.iter().flatten() {
+        let new_value = match active_outputs.get(&ch_block.pwm_channel) {
+            Some(prev) => pwm::slew(prev.value, ch_block.neutral, ch_block.max_step),
+            None => ch_block.neutral,
+        };
+        neutral_outputs.insert(
+            ch_block.pwm_channel,
+            Output {
+                channel: to_pca_channel(ch_block.pwm_channel),
+                value: new_value,
+            },
+        );
+    }
+    active_outputs = neutral_outputs;
+    apply_all(pwm_dev, &active_outputs).context("apply watchdog PWM outputs")?;
+    Ok(())
+}
+
+/// Convert the config's raw PWM channel number (0–15) into the pca9685 Channel enum.
+fn to_pca_channel(ch: u8) -> pwm_pca9685::Channel {
+    match ch {
+         => pwm_pca9685::Channel::C0,  1  => pwm_pca9685::Channel::C1,
+        2  => pwm_pca9685::Channel::C2,  3  => pwm_pca9685::Channel::C3,
+        4  => pwm_pca9685::Channel::C4,  5  => pwm_pca9685::Channel::C5,
+        6  => pwm_pca9685::Channel::C6,  7  => pwm_pca9685::Channel::C7,
+        8  => pwm_pca9685::Channel::C8,  9  => pwm_pca9685::Channel::C9,
+        10 => pwm_pca9685::Channel::C10, 11 => pwm_pca9685::Channel::C11,
+        12 => pwm_pca9685::Channel::C12, 13 => pwm_pca9685::Channel::C13,
+        14 => pwm_pca9685::Channel::C14, 15 => pwm_pca9685::Channel::C15,
+        _ => pwm_pca9685::Channel::C0,
+    }
 }
