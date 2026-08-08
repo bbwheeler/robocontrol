@@ -85,7 +85,7 @@ fn main() -> Result<()> {
             Some(m) => m,
             None if now.duration_since(last_message_time).as_millis() > WATCHDOG_MS as u128 => {
                 log::warn!("Watchdog timeout ({}ms) going neutral", WATCHDOG_MS);
-                send_neutral(&mut pwm_dev, &app)?;
+                send_neutral(&mut pwm_dev, &app, &active_outputs)?;
                 last_message_time = now;
                 continue;
             }
@@ -95,7 +95,7 @@ fn main() -> Result<()> {
         last_message_time = now;
 
         match msg {
-            mavlink::common::MavMessage::ParamValue { .. } => {} // Ignore param values.
+            mavlink::common::MavMessage::ParamValue { .. } | mavlink::common::MavMessage::Heartbeat { .. } | mavlink::common::MavMessage::Statustext { .. } => {} // Ignore param values and common telemetry.
             mavlink::common::MavMessage::RC_CHANNELS_OVERRIDE {
                 target_network_id: _,
                 target_system_id,
@@ -161,9 +161,7 @@ fn initialize_pca9685(path: &str, addr: u8) -> Result<pwm_pca9685::PwmDriver> {
 
 /// Set the PCA9685 prescaler to achieve the desired PWM frequency.
 fn set_prescale(pwm_dev: &mut pwm_pca9685::PwmDriver, prescale: u8) -> Result<()> {
-    // TODO: write prescale register via linux-embedded-hal I2C transaction.
-    log::info!("PWM prescale would be set to {}", prescale);
-    Ok(())
+    Err(anyhow::anyhow!("prescale not yet wired to PCA9685 register"))
 }
 
 /// Send a single MAVLink UDP packet containing given message bytes.
@@ -197,18 +195,11 @@ fn parse_mavlink(data: &[u8]) -> Option<mavlink::common::MavMessage> {
 
 /// Write all active outputs to the PCA9685 hardware.
 fn apply_all(pwm_dev: &mut pwm_pca9685::PwmDriver, outputs: &HashMap<u8, Output>) -> Result<()> {
-    // TODO: for each output, write the appropriate on/off duty counts
-    // to the PCA9685 LEDn registers. The 4096-step resolution means a
-    // value of N maps to ON=N, OFF=1024 (for pulse-width mode).
-    for (ch_id, output) in outputs {
-        log::trace!("Output CH{}: channel={} value={}", ch_id, output.channel as u8, output.value);
-        // TODO: pwm_dev.set_channel_duty(output.channel, output.value);
-    }
-    Ok(())
+    Err(anyhow::anyhow!("apply_all not yet wired to PCA9685 register"))
 }
 
 /// Send neutral to all channels (watchdog failsafe).
-fn send_neutral(pwm_dev: &mut pwm_pca9685::PwmDriver, app: &AppConfig) -> Result<()> {
+fn send_neutral(pwm_dev: &mut pwm_pca9685::PwmDriver, app: &AppConfig, active_outputs: &HashMap<u8, Output>) -> Result<()> {
     let mut neutral_outputs: HashMap<u8, Output> = HashMap::new();
     for ch_block in app.channel_blocks.iter().flatten() {
         let new_value = match active_outputs.get(&ch_block.pwm_channel) {
@@ -223,15 +214,14 @@ fn send_neutral(pwm_dev: &mut pwm_pca9685::PwmDriver, app: &AppConfig) -> Result
             },
         );
     }
-    active_outputs = neutral_outputs;
-    apply_all(pwm_dev, &active_outputs).context("apply watchdog PWM outputs")?;
+    apply_all(pwm_dev, &neutral_outputs).context("apply watchdog PWM outputs")?;
     Ok(())
 }
 
 /// Convert the config's raw PWM channel number (0–15) into the pca9685 Channel enum.
 fn to_pca_channel(ch: u8) -> pwm_pca9685::Channel {
     match ch {
-         => pwm_pca9685::Channel::C0,  1  => pwm_pca9685::Channel::C1,
+        0  => pwm_pca9685::Channel::C0,  1  => pwm_pca9685::Channel::C1,
         2  => pwm_pca9685::Channel::C2,  3  => pwm_pca9685::Channel::C3,
         4  => pwm_pca9685::Channel::C4,  5  => pwm_pca9685::Channel::C5,
         6  => pwm_pca9685::Channel::C6,  7  => pwm_pca9685::Channel::C7,

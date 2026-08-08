@@ -58,7 +58,7 @@ pub fn clamp_to_channel(value: i32, min: u16, max: u16) -> u16 {
 /// into the neutral position, matching ArduPilot convention for "unused channels."
 pub fn mavlink_raw_to_pwm(input: u16, min: u16, max: u16, neutral: u16) -> u16 {
     if input == MAVLINK_CHANNEL_UNUSED_RAW || input == MAVLINK_CHANNEL_NEUTRAL_RAW {
-        return scaled_to_pwm(MAVLINK_SCALED_NEUTRAL as i32, min, max, neutral);
+        return neutral;
     }
 
     let clamped = input.clamp(RAW_MIN as u16, RAW_MAX as u16) as i32;
@@ -73,9 +73,6 @@ pub fn mavlink_raw_to_pwm(input: u16, min: u16, max: u16, neutral: u16) -> u16 {
 ///
 /// Positive values map from `neutral` → `max`, negative from `neutral` → `min`.
 pub fn scaled_to_pwm(input: i32, min: u16, max: u16, neutral: u16) -> u16 {
-    if input == MAVLINK_SCALED_NEUTRAL as i32 {
-        return neutral;
-    }
 
     let clamped = input.clamp(SCALED_MIN, SCALED_MAX);
 
