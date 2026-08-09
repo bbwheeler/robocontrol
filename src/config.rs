@@ -2,6 +2,7 @@
 //!
 
 use serde::Deserialize;
+use anyhow::bail;
 use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone)]
@@ -110,6 +111,7 @@ fn build(raw: RawConfig) -> Result<AppConfig> {
             mavlink_channel: raw_ch.mavlink_channel,
             max_step: raw_ch.max_step,
         });
+        mavlink_to_index.insert(raw_ch.mavlink_channel, i);
     }
 
     // Validate that control channel indices are valid.
