@@ -14,19 +14,19 @@ pub struct ConfigStatic {
 }
 
 #[derive(Debug, Deserialize)]
-pub struct I2cConfig {
-    pub address: u8,
-    pub path: String,
+struct I2cConfig {
+    address: u8,
+    path: String,
 }
 
 #[derive(Debug, Deserialize)]
-pub struct PwmConfig {
-    pub prescale: u8,
+struct PwmConfig {
+    prescale: u8,
 }
 
 #[derive(Debug, Deserialize)]
-pub struct MavlinkConfig {
-    pub port: u16,
+struct MavlinkConfig {
+    port: u16,
 }
 
 #[derive(Debug, Clone, Deserialize)]
