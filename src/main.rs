@@ -9,17 +9,19 @@ mod pwm;
 
 use anyhow::{Context, Result};
 use config::AppConfig;
+use linux_embedded_hal::I2cdev;
 use std::collections::HashMap;
 use std::net::UdpSocket;
 use std::time::Instant;
+use pwm_pca9685::{Address, Channel, Pca9685};
 
 const WATCHDOG_MS: u64 = 500;
 
 /// Internal representation of a PWM channel output.
 #[derive(Debug, Clone)]
 struct Output {
-    channel: pwm_pca9685::Channel,
-    value: u16,
+    channel: Channel,
+     value: u16,
 }
 
 fn main() -> Result<()> {
@@ -46,6 +48,7 @@ fn main() -> Result<()> {
         .with_context(|| format!("init pca9685 on {}", dev_path))?;
     set_prescale(&mut pwm_dev, app.static_config.pwm.prescale)
         .context("set prescale")?;
+    pwm_dev.enable().context("enable pca9685")?;
     log::info!("PCA9685 initialized on {}", dev_path);
 
     // Log configured channels.
@@ -152,16 +155,49 @@ fn main() -> Result<()> {
     }
 }
 
+/// Wrapper around the PCA9685 hardware abstraction.
+struct PwmDriver {
+    pca: Pca9685<I2cdev>,
+}
+
+impl PwmDriver {
+    fn new(path: &str, addr: u8) -> Result<Self> {
+        let i2c = I2cdev::new(path)
+            .with_context(|| format!("Failed to open I2C bus '{path}'"))?;
+        let address = Address::from(addr);
+        let pca = Pca9685::new(i2c, address)
+            .with_context("PCA9685 new")?;
+        Ok(Self { pca })
+    }
+
+    fn set_prescale(&mut self, prescale: u8) -> Result<()> {
+        self.pca
+            .set_prescale(prescale)
+            .map_err(|e| anyhow::anyhow!("PCA9685 set_prescale error: {:?}", e))
+    }
+
+    fn enable(&mut self) -> Result<()> {
+        self.pca
+            .enable()
+            .map_err(|e| anyhow::anyhow!("PCA9685 enable error: {:?}", e))
+    }
+
+    fn set_channel_on_off(&mut self, ch: Channel, on: u16, off: u16) -> Result<()> {
+        self.pca
+            .set_channel_on_off(ch, on, off)
+            .map_err(|e| anyhow::anyhow!("PCA9685 set_channel_on_off error: {:?}", e))
+    }
+}
+
 /// Open and initialize a PCA9685 device on the given I2C bus.
-fn initialize_pca9685(path: &str, addr: u8) -> Result<pwm_pca9685::PwmDriver> {
-    let mut dev = pwm_pca9685::PwmDevice::open(path, addr)?;
-    // TODO: call dev.set_mode() for proper PCA9685 configuration.
+fn initialize_pca9685(path: &str, addr: u8) -> Result<PwmDriver> {
+    let mut dev = PwmDriver::new(path, addr)?;
     Ok(dev)
 }
 
 /// Set the PCA9685 prescaler to achieve the desired PWM frequency.
-fn set_prescale(pwm_dev: &mut pwm_pca9685::PwmDriver, prescale: u8) -> Result<()> {
-    Err(anyhow::anyhow!("prescale not yet wired to PCA9685 register"))
+fn set_prescale(pwm_dev: &mut PwmDriver, prescale: u8) -> Result<()> {
+    pwm_dev.set_prescale(prescale)
 }
 
 /// Send a single MAVLink UDP packet containing given message bytes.
@@ -194,12 +230,15 @@ fn parse_mavlink(data: &[u8]) -> Option<mavlink::common::MavMessage> {
 }
 
 /// Write all active outputs to the PCA9685 hardware.
-fn apply_all(pwm_dev: &mut pwm_pca9685::PwmDriver, outputs: &HashMap<u8, Output>) -> Result<()> {
-    Err(anyhow::anyhow!("apply_all not yet wired to PCA9685 register"))
+fn apply_all(pwm_dev: &mut PwmDriver, outputs: &HashMap<u8, Output>) -> Result<()> {
+    for output in outputs.values() {
+        pwm_dev.set_channel_on_off(output.channel, 0, output.value)?;
+    }
+    Ok(())
 }
 
 /// Send neutral to all channels (watchdog failsafe).
-fn send_neutral(pwm_dev: &mut pwm_pca9685::PwmDriver, app: &AppConfig, active_outputs: &HashMap<u8, Output>) -> Result<()> {
+fn send_neutral(pwm_dev: &mut PwmDriver, app: &AppConfig, active_outputs: &HashMap<u8, Output>) -> Result<()> {
     let mut neutral_outputs: HashMap<u8, Output> = HashMap::new();
     for ch_block in app.channel_blocks.iter().flatten() {
         let new_value = match active_outputs.get(&ch_block.pwm_channel) {
@@ -219,16 +258,16 @@ fn send_neutral(pwm_dev: &mut pwm_pca9685::PwmDriver, app: &AppConfig, active_ou
 }
 
 /// Convert the config's raw PWM channel number (0–15) into the pca9685 Channel enum.
-fn to_pca_channel(ch: u8) -> pwm_pca9685::Channel {
+fn to_pca_channel(ch: u8) -> Channel {
     match ch {
-        0  => pwm_pca9685::Channel::C0,  1  => pwm_pca9685::Channel::C1,
-        2  => pwm_pca9685::Channel::C2,  3  => pwm_pca9685::Channel::C3,
-        4  => pwm_pca9685::Channel::C4,  5  => pwm_pca9685::Channel::C5,
-        6  => pwm_pca9685::Channel::C6,  7  => pwm_pca9685::Channel::C7,
-        8  => pwm_pca9685::Channel::C8,  9  => pwm_pca9685::Channel::C9,
-        10 => pwm_pca9685::Channel::C10, 11 => pwm_pca9685::Channel::C11,
-        12 => pwm_pca9685::Channel::C12, 13 => pwm_pca9685::Channel::C13,
-        14 => pwm_pca9685::Channel::C14, 15 => pwm_pca9685::Channel::C15,
-        _ => pwm_pca9685::Channel::C0,
+        0  => Channel::C0,  1  => Channel::C1,
+        2  => Channel::C2,  3  => Channel::C3,
+        4  => Channel::C4,  5  => Channel::C5,
+        6  => Channel::C6,  7  => Channel::C7,
+        8  => Channel::C8,  9  => Channel::C9,
+        10 => Channel::C10, 11 => Channel::C11,
+        12 => Channel::C12, 13 => Channel::C13,
+        14 => Channel::C14, 15 => Channel::C15,
+        _ => Channel::C0,
     }
 }

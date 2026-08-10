@@ -4,6 +4,8 @@
 
 // ── MAVLink magic constants with documented protocol semantics ──
 
+use pwm_pca9685::Channel;
+
 /// Raw (1000–2000 microseconds) value meaning "this channel is unused."
 pub const MAVLINK_CHANNEL_UNUSED_RAW: u16 = 0;
 
@@ -28,7 +30,7 @@ const SCALED_MAX: i32 = 10_000;
 /// Represents a per-channel PWM output value and its associated hardware channel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AbsoluteControlOutput {
-    pub channel: pwm_pca9685::Channel,
+    pub channel: Channel,
     pub value: u16,
 }
 
@@ -58,7 +60,7 @@ pub fn clamp_to_channel(value: i32, min: u16, max: u16) -> u16 {
 /// into the neutral position, matching ArduPilot convention for "unused channels."
 pub fn mavlink_raw_to_pwm(input: u16, min: u16, max: u16, neutral: u16) -> u16 {
     if input == MAVLINK_CHANNEL_UNUSED_RAW || input == MAVLINK_CHANNEL_NEUTRAL_RAW {
-        return scaled_to_pwm(MAVLINK_SCALED_NEUTRAL as i32, min, max, neutral);
+        return neutral;
     }
 
     let clamped = input.clamp(RAW_MIN as u16, RAW_MAX as u16) as i32;
@@ -73,9 +75,6 @@ pub fn mavlink_raw_to_pwm(input: u16, min: u16, max: u16, neutral: u16) -> u16 {
 ///
 /// Positive values map from `neutral` → `max`, negative from `neutral` → `min`.
 pub fn scaled_to_pwm(input: i32, min: u16, max: u16, neutral: u16) -> u16 {
-    if input == MAVLINK_SCALED_NEUTRAL as i32 {
-        return neutral;
-    }
 
     let clamped = input.clamp(SCALED_MIN, SCALED_MAX);
 
