@@ -4,6 +4,8 @@
 
 // ── MAVLink magic constants with documented protocol semantics ──
 
+use pwm_pca9685::Channel;
+
 /// Raw (1000–2000 microseconds) value meaning "this channel is unused."
 pub const MAVLINK_CHANNEL_UNUSED_RAW: u16 = 0;
 
@@ -28,7 +30,7 @@ const SCALED_MAX: i32 = 10_000;
 /// Represents a per-channel PWM output value and its associated hardware channel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AbsoluteControlOutput {
-    pub channel: pwm_pca9685::Channel,
+    pub channel: Channel,
     pub value: u16,
 }
 
