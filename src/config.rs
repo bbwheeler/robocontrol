@@ -74,6 +74,13 @@ pub struct AppConfig {
     pub mavlink_to_index: HashMap<u8, usize>,
 }
 
+impl AppConfig {
+    /// Returns the total number of configured (non-None) channel entries.
+    pub fn channel_count(&self) -> usize {
+        self.channel_blocks.iter().filter(|c| c.is_some()).count()
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 struct Controls {
     steering: u8,
