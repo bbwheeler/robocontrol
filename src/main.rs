@@ -21,7 +21,7 @@ const WATCHDOG_MS: u64 = 500;
 #[derive(Debug, Clone)]
 struct Output {
     channel: Channel,
-     value: u16,
+    pub value: u16,
 }
 
 fn main() -> Result<()> {

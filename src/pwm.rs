@@ -13,8 +13,12 @@ pub const MAVLINK_CHANNEL_UNUSED_RAW: u16 = 0;
 /// This is a quirk of how ArduPilot/MAVProxy encode "pass through neutral."
 pub const MAVLINK_CHANNEL_NEUTRAL_RAW: u16 = u16::MAX;
 
-/// Scaled (-10000 – 10000) value meaning "use neutral" in `mavlink_scaled_to_pwm`.
+/// Scaled (-10000 – 10000) value meaning "use neutral" in `scaled_to_pwm`.
+/// Intentionally stored as i16 to match typical MAVLink control ranges, though the function takes i32.
 pub const MAVLINK_SCALED_NEUTRAL: i16 = i16::MAX;
+
+// Note: this constant is only needed if external callers want sentinel neutral values in scaled mode.
+// The pwm module functions themselves don't use it—they rely on 0 meaning neutral by default.
 
 // ── Constants ──
 

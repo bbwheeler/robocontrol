@@ -14,19 +14,19 @@ pub struct ConfigStatic {
 }
 
 #[derive(Debug, Deserialize)]
-struct I2cConfig {
-    address: u8,
-    path: String,
+pub struct I2cConfig {
+    pub address: u8,
+    pub path: String,
 }
 
 #[derive(Debug, Deserialize)]
-struct PwmConfig {
-    prescale: u8,
+pub struct PwmConfig {
+    pub prescale: u8,
 }
 
 #[derive(Debug, Deserialize)]
-struct MavlinkConfig {
-    port: u16,
+pub struct MavlinkConfig {
+    pub port: u16,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -72,6 +72,13 @@ pub struct AppConfig {
     pub channels: [Option<ActiveChannel>; 16],
     pub channel_blocks: [Option<ChannelConfigBlock>; 16],
     pub mavlink_to_index: HashMap<u8, usize>,
+}
+
+impl AppConfig {
+    /// Returns the total number of configured (non-None) channel entries.
+    pub fn channel_count(&self) -> usize {
+        self.channel_blocks.iter().filter(|c| c.is_some()).count()
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
