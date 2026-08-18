@@ -122,27 +122,31 @@ fn main() -> Result<()> {
                     target_system_id, raw_values,
                 );
 
-                for (i, &raw_val) in raw_values.iter().enumerate() {
-                    if let Some(ch_block) = app.channel_blocks[i].as_ref() {
-                        // Translate raw MAVLink pulse width to calibrated PWM duty count.
-                        let duty = pwm::mavlink_raw_to_pwm(
-                            raw_val, ch_block.min, ch_block.max, ch_block.neutral,
-                        );
-
-                        let new_value = match active_outputs.get(&ch_block.pwm_channel) {
-                            Some(prev) if prev.value == duty => duty,
-                            Some(prev) => pwm::slew(prev.value, duty, ch_block.max_step),
-                            None => duty,
-                        };
-
-                        active_outputs.insert(
-                            ch_block.pwm_channel,
-                            Output {
-                                channel: to_pca_channel(ch_block.pwm_channel),
-                                value: new_value,
-                            },
-                        );
+                for ch_block in app.channel_blocks.iter().flatten() {
+                    let mav_ch = (ch_block.mavlink_channel - 1) as usize;
+                    if mav_ch >= raw_values.len() {
+                        continue;
                     }
+                    let raw_val = raw_values[mav_ch];
+
+                    // Translate raw MAVLink pulse width to calibrated PWM duty count.
+                    let duty = pwm::mavlink_raw_to_pwm(
+                        raw_val, ch_block.min, ch_block.max, ch_block.neutral,
+                    );
+
+                    let new_value = match active_outputs.get(&ch_block.pwm_channel) {
+                        Some(prev) if prev.value == duty => duty,
+                        Some(prev) => pwm::slew(prev.value, duty, ch_block.max_step),
+                        None => duty,
+                    };
+
+                    active_outputs.insert(
+                        ch_block.pwm_channel,
+                        Output {
+                            channel: to_pca_channel(ch_block.pwm_channel),
+                            value: new_value,
+                        },
+                    );
                 }
 
                 apply_all(&mut pwm_dev, &active_outputs)
