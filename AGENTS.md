@@ -20,18 +20,18 @@ This runs on a Raspberry Pi with a PCA9685 on the I2C interface — it will not 
 - **MAVLink ports**: Default listens on `udp in :14550` (set by `[mav].port` in config).
 - **Channel mapping**: Each channel entry maps one PWM hardware channel to one MAVLink raw value (1000–2000 µs range) and/or scaled input (-10000–10000). Look at `translate_message()` and the `mavlink_*_to_pwm()` helpers for scaling logic.
 
-## Beginning Tasks
-Before you begin, follow these steps:
-1. Make sure all existing changes have been checked in; if there are existing changes, commit them and push them to git.wheeli.ca.
-2. Do a git fetch so that you have all of the latest changes.
-3. Switch to a branch or create a branch appropriate for the changes that you will make
+## Version Control
 
-## Finishing Tasks
-Once you complete any changes, additions, deletions, or modifications, follow these steps:
-1. Check the code into a branch using git
-2. Push the code to git.wheeli.ca
-3. Open a Pull Request for the changes you just pushed
-4. Add me (brian) as a reviewer on the Pull Request
+### Submitting Changes
 
-## Credentials
-Your credentials for git.wheeli.ca can be found in the parent directory (../credentials.md)
+All changes, edits, documents, and artifacts must be pushed to the repository when complete. To do so, these steps must be followed:
+1. Commit the code into a branch using git
+2. Push the code to remote origin (git.wheeli.ca)
+3. Open a pull request for the changes you just pushed
+4. Add me (username: brian) as a reviewer on the merge request
+
+### Tools
+
+The Forgeji MCP (command: forgejo_mcp) can be used to execute tasks on git.wheeli.ca such as putting up a PR or MR.
+
+Credentials for the Forgejo instance git.wheeli.ca can be found in the parent directory (../credentials.md)
