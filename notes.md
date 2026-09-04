@@ -1,6 +1,6 @@
 ## Compilation problems:
 
-Compile with the Raspberry Pi architecture as the target
+Compile with the Raspberry Pi 3b architecture as the target
 
 Edit config file:
 ```
