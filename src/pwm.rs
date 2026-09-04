@@ -13,23 +13,23 @@ pub const MAVLINK_CHANNEL_UNUSED_RAW: u16 = 0;
 /// This is a quirk of how ArduPilot/MAVProxy encode "pass through neutral."
 pub const MAVLINK_CHANNEL_NEUTRAL_RAW: u16 = u16::MAX;
 
-/// Scaled (-10000 – 10000) value meaning "use neutral" in `scaled_to_pwm`.
-/// Intentionally stored as i16 to match typical MAVLink control ranges, though the function takes i32.
-pub const MAVLINK_SCALED_NEUTRAL: i16 = i16::MAX;
-
-// Note: this constant is only needed if external callers want sentinel neutral values in scaled mode.
-// The pwm module functions themselves don't use it—they rely on 0 meaning neutral by default.
-
 // ── Constants ──
 
-/// Raw PWM range minimum (1000 µs).
-const RAW_MIN: i32 = 1000;
-/// Raw PWM range maximum (2000 µs).
-const RAW_MAX: i32 = 2000;
-/// Scaled PWM range min (-10000).
-const SCALED_MIN: i32 = -10_000;
-/// Scaled PWM range max (10000).
-const SCALED_MAX: i32 = 10_000;
+/// The raw MAVLink pulse range this application assumes (1000–2000 µs).
+///
+/// This follows the RC_CHANNELS_OVERRIDE convention where a value of 0
+/// means "unused" and `u16::MAX` means "pass through neutral". Different
+/// MAVLink messages use different scaled ranges — these values are
+/// application-specific assumptions, not protocol constants.
+const APP_RAW_PULSE_MIN: i32 = 1000;
+/// The raw MAVLink pulse range this application assumes (1000–2000 µs).
+const APP_RAW_PULSE_MAX: i32 = 2000;
+
+/// This application's scaled-range bound.
+/// Maps the raw 1000–2000 µs range to `[-SCALED_BOUND, +SCALED_BOUND]`
+/// to mimic the MAVLink `MANUAL_CONTROL` convention that ArduPilot
+/// ground control stations commonly emit.
+const SCALED_BOUND: i32 = 10_000;
 
 /// Represents a per-channel PWM output value and its associated hardware channel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,10 +67,11 @@ pub fn mavlink_raw_to_pwm(input: u16, min: u16, max: u16, neutral: u16) -> u16 {
         return neutral;
     }
 
-    let clamped = input.clamp(RAW_MIN as u16, RAW_MAX as u16) as i32;
+    let clamped = input.clamp(APP_RAW_PULSE_MIN as u16, APP_RAW_PULSE_MAX as u16) as i32;
 
-    // Map [1000..2000] → [-10000..10000] (scaled)
-    let scaled: i32 = ((clamped - RAW_MIN) * SCALED_MAX / (RAW_MAX - RAW_MIN)) as i32;
+    // Map [1000..2000] → [-SCALED_BOUND..SCALED_BOUND] (scaled)
+    let scaled: i32 =
+        (clamped - APP_RAW_PULSE_MIN) * SCALED_BOUND / (APP_RAW_PULSE_MAX - APP_RAW_PULSE_MIN);
 
     scaled_to_pwm(scaled, min, max, neutral)
 }
@@ -79,15 +80,14 @@ pub fn mavlink_raw_to_pwm(input: u16, min: u16, max: u16, neutral: u16) -> u16 {
 ///
 /// Positive values map from `neutral` → `max`, negative from `neutral` → `min`.
 pub fn scaled_to_pwm(input: i32, min: u16, max: u16, neutral: u16) -> u16 {
-
-    let clamped = input.clamp(SCALED_MIN, SCALED_MAX);
+    let clamped = input.clamp(-SCALED_BOUND, SCALED_BOUND);
 
     if clamped >= 0 {
         let range = (max - neutral) as i32;
-        neutral + (clamped * range / SCALED_MAX) as u16
+        neutral + (clamped * range / SCALED_BOUND) as u16
     } else {
         let range = (neutral - min) as i32;
-        neutral.saturating_sub(((clamped.unsigned_abs() * range) / SCALED_MAX) as u16)
+        neutral.saturating_sub(((clamped.unsigned_abs() * range) / SCALED_BOUND) as u16)
     }
 }
 
@@ -219,7 +219,7 @@ mod tests {
 
     #[test]
     fn raw_undefined_returns_neutral_via_magic_constant() {
-        // The special-cased values map to neutral via MAVLINK_SCALED_NEUTRAL
+        // The special-cased raw values map to neutral via the MAVLINK raw sentinel constants
         let result = mavlink_raw_to_pwm(MAVLINK_CHANNEL_UNUSED_RAW, 200, 600, 400);
         assert_eq!(result, 400);
 
