@@ -12,7 +12,7 @@ use config::AppConfig;
 use linux_embedded_hal::I2cdev;
 use std::collections::HashMap;
 use std::net::UdpSocket;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use pwm::guard_pwm_value;
 use pwm_pca9685::{Address, Channel, Pca9685};
 
@@ -80,7 +80,7 @@ fn main() -> Result<()> {
         udp.set_read_timeout(Some(std::time::Duration::from_millis(1))).ok();
         let msg = match recv_from(&udp, &mut [0u8; 4096]) {
             Some(m) => m,
-            None if now.duration_since(last_message_time).as_millis() > WATCHDOG_MS as u128 => {
+            None if now.duration_since(last_message_time) > Duration::from_millis(WATCHDOG_MS) => {
                 log::warn!("Watchdog timeout ({}ms) going neutral", WATCHDOG_MS);
                 send_neutral(&mut pwm_dev, &app, &active_outputs)?;
                 last_message_time = now;
