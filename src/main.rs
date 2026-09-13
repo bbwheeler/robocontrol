@@ -77,7 +77,7 @@ fn main() -> Result<()> {
         let now = Instant::now();
 
         // Read MAVLink message with a short timeout.
-        udp.set_read_timeout(Some(std::time::Duration::from_millis(1))).ok();
+        udp.set_read_timeout(Some(Duration::from_millis(50))).ok();
         let msg = match recv_from(&udp, &mut [0u8; 4096]) {
             Some(m) => m,
             None if now.duration_since(last_message_time) > Duration::from_millis(WATCHDOG_MS) => {
