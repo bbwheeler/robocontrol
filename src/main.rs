@@ -13,6 +13,7 @@ use linux_embedded_hal::I2cdev;
 use std::collections::HashMap;
 use std::net::UdpSocket;
 use std::time::Instant;
+use pwm::guard_pwm_value;
 use pwm_pca9685::{Address, Channel, Pca9685};
 
 const WATCHDOG_MS: u64 = 500;
@@ -28,13 +29,6 @@ fn main() -> Result<()> {
     env_logger::init();
 
     let app = config::load().context("failed to load config")?;
-
-    log::info!(
-        "Starting RoboControl: {} channels, I2C={}, port={}",
-        app.channel_blocks.iter().filter(|c| c.is_some()).count(),
-        app.static_config.i2c.path,
-        app.static_config.mav.port,
-    );
 
     // Open the MAVLink UDP socket for receiving commands.
     let bind_addr = format!("0.0.0.0:{}", app.static_config.mav.port);
@@ -75,7 +69,7 @@ fn main() -> Result<()> {
             },
         );
     }
-    apply_all(&mut pwm_dev, &active_outputs).context("apply startup neutral outputs")?;
+    apply_all(&mut pwm_dev, &app, &active_outputs).context("apply startup neutral outputs")?;
 
     let mut last_message_time = Instant::now();
 
@@ -149,7 +143,7 @@ fn main() -> Result<()> {
                     );
                 }
 
-                apply_all(&mut pwm_dev, &active_outputs)
+                apply_all(&mut pwm_dev, &app, &active_outputs)
                     .context("apply PWM outputs")?;
             }
             _ => {
@@ -234,9 +228,22 @@ fn parse_mavlink(data: &[u8]) -> Option<mavlink::common::MavMessage> {
 }
 
 /// Write all active outputs to the PCA9685 hardware.
-fn apply_all(pwm_dev: &mut PwmDriver, outputs: &HashMap<u8, Output>) -> Result<()> {
-    for output in outputs.values() {
-        pwm_dev.set_channel_on_off(output.channel, 0, output.value)?;
+///
+/// Every value is validated against its channel's calibrated `[min, max]`
+/// bounds *before* it is written (code review item #16). An out-of-range
+/// value is clamped into range and a warning is logged, instead of being
+/// silently accepted by the chip's register clamping — which would hide the
+/// underlying bug (e.g. a config typo with swapped min/max, or a computed
+/// value that escaped the scaling helpers).
+fn apply_all(pwm_dev: &mut PwmDriver, app: &AppConfig, outputs: &HashMap<u8, Output>) -> Result<()> {
+    for (channel, output) in outputs {
+        let value = match app.channel_bounds(*channel) {
+            Some((min, max)) => guard_pwm_value(*channel, output.value, min, max),
+            // No bounds are known for this channel (shouldn't happen, as
+            // outputs are only built from configured channels) — pass through.
+            None => output.value,
+        };
+        pwm_dev.set_channel_on_off(output.channel, 0, value)?;
     }
     Ok(())
 }
@@ -257,7 +264,7 @@ fn send_neutral(pwm_dev: &mut PwmDriver, app: &AppConfig, active_outputs: &HashM
             },
         );
     }
-    apply_all(pwm_dev, &neutral_outputs).context("apply watchdog PWM outputs")?;
+    apply_all(pwm_dev, app, &neutral_outputs).context("apply watchdog PWM outputs")?;
     Ok(())
 }
 

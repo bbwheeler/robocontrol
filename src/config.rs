@@ -61,6 +61,18 @@ impl AppConfig {
     pub fn channel_count(&self) -> usize {
         self.channel_blocks.iter().filter(|c| c.is_some()).count()
     }
+
+    /// Returns the `(min, max)` pulse-width bounds for a PWM channel index,
+    /// or `None` if no channel is configured at that index.
+    ///
+    /// Used by the apply-time guard (code review item #16) to validate that a
+    /// PWM value is within the channel's calibrated range before it is written
+    /// to the hardware.
+    pub fn channel_bounds(&self, channel: u8) -> Option<(u16, u16)> {
+        self.channel_blocks[channel as usize]
+            .as_ref()
+            .map(|b| (b.min, b.max))
+    }
 }
 
 /// Optional control-channel designations (0–15 indices into `[[channel]]`).

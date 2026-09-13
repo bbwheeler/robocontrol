@@ -58,6 +58,39 @@ pub fn clamp_to_channel(value: i32, min: u16, max: u16) -> u16 {
     (value.clamp(min as i32, max as i32)) as u16
 }
 
+/// Apply-time guard (code review item #16): keep a PWM value within a
+/// channel's `[min, max]` bounds before it is written to the PCA9685.
+///
+/// A value already inside `[min, max]` is returned unchanged. An
+/// out-of-range value is clamped into `[min, max]` and a warning is logged
+/// that names the channel, the offending value, *and both* the min and max
+/// bounds. Without this a config typo (e.g. swapped min/max) or an
+/// out-of-range computed value would reach the hardware unclamped, and the
+/// chip would silently clamp it and mask the underlying bug.
+///
+/// The function is total — it never panics. The normal path clamps within
+/// `[min, max]`; the degenerate case where the bounds are inverted
+/// (`min > max`, a configuration bug already rejected at load time) returns
+/// the more conservative (smaller) of the two bounds instead of panicking.
+pub fn guard_pwm_value(channel: u8, value: u16, min: u16, max: u16) -> u16 {
+    if value < min || value > max {
+        let clamped = if min <= max {
+            value.clamp(min, max)
+        } else {
+            // Defensive only: bounds are inverted (rejected at config load
+            // time). Fall back to the smaller bound rather than panicking.
+            min.min(max)
+        };
+        log::warn!(
+            "CH{}: PWM value {} out of configured range [{}..{}]; clamping to {}",
+            channel, value, min, max, clamped
+        );
+        clamped
+    } else {
+        value
+    }
+}
+
 /// Convert a MAVLink raw pulse-width value (1000–2000 µs) to a calibrated PWM duty count.
 ///
 /// Protocol mapping: `raw` values of 0 or `u16::MAX` are control-their-own special-cased
@@ -156,6 +189,170 @@ mod tests {
     #[test]
     fn clamp_in_range_returns_input() {
         assert_eq!(clamp_to_channel(400, 200, 600), 400);
+    }
+
+    // ── guard_pwm_value (item #16) tests ──
+    //
+    // `LogCapture` is a self-contained `log::Log` impl that records the
+    // (level, message) pairs emitted through the `log` facade, so a test can
+    // assert on the warning text without pulling in a new dev-dependency.
+    //
+    // `log::set_logger` is process-global and can only be installed once; the
+    // four tests below share a single capture buffer, and each clears it in
+    // `begin()` before asserting. `cargo test` runs tests on parallel threads,
+    // so a `Mutex` serializes them to prevent one test's clear from wiping
+    // another's just-captured records.
+
+    use std::sync::Mutex;
+
+    static LOG_BUF: std::sync::OnceLock<Mutex<Vec<(log::Level, String)>>> =
+        std::sync::OnceLock::new();
+    static LOGGER: std::sync::OnceLock<LogCapture> = std::sync::OnceLock::new();
+
+    // Serializes the four guard tests so they cannot interleave clearing/
+    // reading the shared log buffer (cargo test runs tests on parallel
+    // threads). Held for the whole body of each test.
+    static LOG_TEST_LOCK: std::sync::OnceLock<Mutex<()>> = std::sync::OnceLock::new();
+
+    fn test_lock() -> std::sync::MutexGuard<'static, ()> {
+        LOG_TEST_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap()
+    }
+
+    struct LogCapture;
+
+    impl LogCapture {
+        fn buf() -> &'static Mutex<Vec<(log::Level, String)>> {
+            LOG_BUF.get_or_init(|| Mutex::new(Vec::new()))
+        }
+
+        /// Install the capture logger exactly once and clear the buffer.
+        fn begin() {
+            let instance = LOGGER.get_or_init(|| LogCapture);
+            let _ = log::set_logger(instance).map(|_| {
+                log::set_max_level(log::LevelFilter::Warn);
+            });
+            Self::buf().lock().unwrap().clear();
+        }
+
+        fn warn_messages() -> Vec<String> {
+            Self::buf()
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(lvl, _)| *lvl == log::Level::Warn)
+                .map(|(_, msg)| msg.clone())
+                .collect()
+        }
+    }
+
+    impl log::Log for LogCapture {
+        fn enabled(&self, _metadata: &log::Metadata) -> bool {
+            // `log` gates records through `enabled`; accept them so the test
+            // captures every emitted WARN record.
+            true
+        }
+
+        fn log(&self, record: &log::Record) {
+            Self::buf()
+                .lock()
+                .unwrap()
+                .push((record.level(), record.args().to_string()));
+        }
+
+        fn flush(&self) {}
+    }
+
+    #[test]
+    fn guard_in_range_returns_value_unchanged_and_logs_nothing() {
+        let _guard = test_lock();
+        LogCapture::begin();
+
+        // Exactly on each bound and strictly inside.
+        assert_eq!(guard_pwm_value(0, 250, 250, 550), 250);
+        assert_eq!(guard_pwm_value(0, 550, 250, 550), 550);
+        assert_eq!(guard_pwm_value(0, 400, 250, 550), 400);
+        assert_eq!(guard_pwm_value(1, 300, 200, 600), 300);
+
+        assert!(
+            LogCapture::warn_messages().is_empty(),
+            "in-range values must not log a warning, got: {:?}",
+            LogCapture::warn_messages()
+        );
+    }
+
+    #[test]
+    fn guard_below_min_clamps_to_min_and_warns() {
+        let _guard = test_lock();
+        LogCapture::begin();
+
+        let result = guard_pwm_value(0, 100, 250, 550);
+        assert_eq!(result, 250);
+
+        let warnings = LogCapture::warn_messages();
+        assert_eq!(warnings.len(), 1);
+        let msg = &warnings[0];
+        assert!(msg.contains("CH0"), "warning should name the channel; got {msg}");
+        assert!(msg.contains("100"), "warning should name the offending value; got {msg}");
+        assert!(
+            msg.contains("250") && msg.contains("550"),
+            "warning should name BOTH min (250) and max (550) bounds; got {msg}"
+        );
+        assert!(msg.contains("clamp"), "warning should describe the fallback; got {msg}");
+    }
+
+    #[test]
+    fn guard_above_max_clamps_to_max_and_warns() {
+        let _guard = test_lock();
+        LogCapture::begin();
+
+        let result = guard_pwm_value(3, 900, 250, 550);
+        assert_eq!(result, 550);
+
+        let warnings = LogCapture::warn_messages();
+        assert_eq!(warnings.len(), 1);
+        let msg = &warnings[0];
+        assert!(msg.contains("CH3"), "warning should name the channel; got {msg}");
+        assert!(msg.contains("900"), "warning should name the offending value; got {msg}");
+        assert!(
+            msg.contains("250") && msg.contains("550"),
+            "warning should name BOTH min (250) and max (550) bounds; got {msg}"
+        );
+    }
+
+    #[test]
+    fn guard_inverted_bounds_is_total_and_chooses_conservative_bound() {
+        let _guard = test_lock();
+        LogCapture::begin();
+
+        // Item #16 explicitly calls out a config typo that swaps min/max.
+        // The original two-branch guard would pass every value through
+        // silently in this case; this implementation must handle it.
+        // value = 300, bounds inverted min=550, max=250.
+        // The "lower" bound (250) is the more conservative (smallest) safe
+        // value to apply, so the guard returns it and warns.
+        let result = guard_pwm_value(1, 300, 550, 250);
+        assert_eq!(result, 250);
+
+        let warnings = LogCapture::warn_messages();
+        assert_eq!(warnings.len(), 1);
+        let msg = &warnings[0];
+        assert!(msg.contains("CH1"), "warning should name the channel; got {msg}");
+        assert!(
+            msg.contains("out of configured range"),
+            "warning should describe the guard's fallback; got {msg}"
+        );
+        assert!(
+            msg.contains("550") && msg.contains("250"),
+            "warning should name BOTH bounds of the config typo (min=550, max=250); got {msg}"
+        );
+
+        // The guard is total and never panics even with inverted bounds — it
+        // falls back to the smaller of the two bounds (250 here).
+        assert_eq!(guard_pwm_value(1, 900, 550, 250), 250);
+        assert_eq!(guard_pwm_value(1, 100, 550, 250), 250);
     }
 
     // ── scaled_to_pwm tests ──
