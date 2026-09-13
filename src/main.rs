@@ -198,12 +198,6 @@ fn set_prescale(pwm_dev: &mut PwmDriver, prescale: u8) -> Result<()> {
     pwm_dev.set_prescale(prescale)
 }
 
-/// Send a single MAVLink UDP packet containing given message bytes.
-fn send_to<M: Into<Vec<u8>>>(socket: &UdpSocket, peer_addr: &str, data: M) -> Result<()> {
-    socket.send_to(data.into().as_slice(), peer_addr)?;
-    Ok(())
-}
-
 /// Receive a MAVLink message from the UDP socket, returning None on timeout.
 fn recv_from(socket: &UdpSocket, buf: &mut [u8; 4096]) -> Option<mavlink::common::MavMessage> {
     match socket.recv_from(buf) {
