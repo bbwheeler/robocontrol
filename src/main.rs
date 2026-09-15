@@ -171,19 +171,19 @@ impl PwmDriver {
     fn set_prescale(&mut self, prescale: u8) -> Result<()> {
         self.pca
             .set_prescale(prescale)
-            .map_err(|e| anyhow::anyhow!("PCA9685 set_prescale error: {:?}", e))
+            .context("PCA9685 set_prescale")
     }
 
     fn enable(&mut self) -> Result<()> {
         self.pca
             .enable()
-            .map_err(|e| anyhow::anyhow!("PCA9685 enable error: {:?}", e))
+            .context("PCA9685 enable")
     }
 
     fn set_channel_on_off(&mut self, ch: Channel, on: u16, off: u16) -> Result<()> {
         self.pca
             .set_channel_on_off(ch, on, off)
-            .map_err(|e| anyhow::anyhow!("PCA9685 set_channel_on_off error: {:?}", e))
+            .with_context(|| format!("PCA9685 set_channel_on_off on channel {:?}", ch))
     }
 }
 
