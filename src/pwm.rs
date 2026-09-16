@@ -119,8 +119,15 @@ pub fn scaled_to_pwm(input: i32, min: u16, max: u16, neutral: u16) -> u16 {
         let range = (max - neutral) as i32;
         neutral + (clamped * range / SCALED_BOUND) as u16
     } else {
-        let range = (neutral - min) as i32;
-        neutral.saturating_sub(((clamped.unsigned_abs() * range) / SCALED_BOUND) as u16)
+        // Negative branch: `clamped` is in `[-SCALED_BOUND, 0)`, so
+        // `clamped.unsigned_abs()` is `u32`. To keep the multiply and divide
+        // on a single unsigned type (the 0–4095 PCA range fits in `u32`),
+        // `range` and the bound are converted to `u32` here. `range =
+        // neutral - min >= 0` (config guarantees `neutral >= min`), so the
+        // conversion is lossless.
+        let range: u32 = (neutral - min) as u32;
+        let clamped_abs: u32 = clamped.unsigned_abs();
+        neutral.saturating_sub(((clamped_abs * range) / SCALED_BOUND as u32) as u16)
     }
 }
 

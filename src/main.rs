@@ -10,6 +10,7 @@ mod pwm;
 use anyhow::{Context, Result};
 use config::AppConfig;
 use linux_embedded_hal::I2cdev;
+use mavlink::peek_reader::PeekReader;
 use std::collections::HashMap;
 use std::net::UdpSocket;
 use std::time::{Duration, Instant};
@@ -92,28 +93,16 @@ fn main() -> Result<()> {
         last_message_time = now;
 
         match msg {
-            mavlink::common::MavMessage::ParamValue { .. } | mavlink::common::MavMessage::Heartbeat { .. } | mavlink::common::MavMessage::Statustext { .. } => {} // Ignore param values and common telemetry.
-            mavlink::common::MavMessage::RC_CHANNELS_OVERRIDE {
-                target_network_id: _,
-                target_system_id,
-                target_component_id: _,
-                ref chan1_raw,
-                ref chan2_raw,
-                ref chan3_raw,
-                ref chan4_raw,
-                ref chan5_raw,
-                ref chan6_raw,
-                ref chan7_raw,
-                ref chan8_raw,
-            } => {
+            mavlink::common::MavMessage::PARAM_VALUE(_) | mavlink::common::MavMessage::HEARTBEAT(_) | mavlink::common::MavMessage::STATUSTEXT(_) => {} // Ignore param values and common telemetry.
+            mavlink::common::MavMessage::RC_CHANNELS_OVERRIDE(msg) => {
                 let raw_values: Vec<u16> = vec![
-                    *chan1_raw, *chan2_raw, *chan3_raw, *chan4_raw,
-                    *chan5_raw, *chan6_raw, *chan7_raw, *chan8_raw,
+                    msg.chan1_raw, msg.chan2_raw, msg.chan3_raw, msg.chan4_raw,
+                    msg.chan5_raw, msg.chan6_raw, msg.chan7_raw, msg.chan8_raw,
                 ];
 
                 log::debug!(
                     "RC_CHANNELS_OVERRIDE from sys#{}: {:?}",
-                    target_system_id, raw_values,
+                    msg.target_system, raw_values,
                 );
 
                 for ch_block in app.channel_blocks.iter().flatten() {
@@ -164,7 +153,7 @@ impl PwmDriver {
             .with_context(|| format!("Failed to open I2C bus '{path}'"))?;
         let address = Address::from(addr);
         let pca = Pca9685::new(i2c, address)
-            .with_context("PCA9685 new")?;
+            .with_context(|| "PCA9685 new".to_string())?;
         Ok(Self { pca })
     }
 
@@ -189,7 +178,7 @@ impl PwmDriver {
 
 /// Open and initialize a PCA9685 device on the given I2C bus.
 fn initialize_pca9685(path: &str, addr: u8) -> Result<PwmDriver> {
-    let mut dev = PwmDriver::new(path, addr)?;
+    let dev = PwmDriver::new(path, addr)?;
     Ok(dev)
 }
 
@@ -201,7 +190,15 @@ fn set_prescale(pwm_dev: &mut PwmDriver, prescale: u8) -> Result<()> {
 /// Receive a MAVLink message from the UDP socket, returning None on timeout.
 fn recv_from(socket: &UdpSocket, buf: &mut [u8; 4096]) -> Option<mavlink::common::MavMessage> {
     match socket.recv_from(buf) {
-        Ok((n, _)) if n > 0 => parse_mavlink(&buf[..n]),
+        Ok((received, _addr)) => {
+            if received > 0 {
+                parse_mavlink(&buf[..received])
+            } else {
+                // Zero bytes received is equivalent to a timeout — avoid a hot spin.
+                log::debug!("recv_from: 0 bytes received (timeout)");
+                None
+            }
+        }
         Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => None,
         Err(e) => {
             log::error!("MAVLink socket read error: {}", e);
@@ -210,10 +207,11 @@ fn recv_from(socket: &UdpSocket, buf: &mut [u8; 4096]) -> Option<mavlink::common
     }
 }
 
-/// Parse raw bytes as a MAVLink message.
+/// Parse raw bytes as a MAVLink V2 message.
 fn parse_mavlink(data: &[u8]) -> Option<mavlink::common::MavMessage> {
-    match mavlink::from_bytes::<mavlink::common::MavMessage>(data) {
-        Ok((msg, _)) => Some(msg),
+    let mut reader = PeekReader::new(data);
+    match mavlink::read_v2_msg::<mavlink::common::MavMessage, _>(&mut reader) {
+        Ok((_header, msg)) => Some(msg),
         Err(e) => {
             log::debug!("Parse error: {}", e);
             None
