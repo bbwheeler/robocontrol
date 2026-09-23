@@ -79,7 +79,7 @@ fn main() -> Result<()> {
 
         // Read MAVLink message with a short timeout.
         udp.set_read_timeout(Some(Duration::from_millis(50))).ok();
-        let msg = match recv_from(&udp, &mut [0u8; 4096]) {
+        let (header, msg) = match recv_from(&udp, &mut [0u8; 4096]) {
             Some(m) => m,
             None if now.duration_since(last_message_time) > Duration::from_millis(WATCHDOG_MS) => {
                 log::warn!("Watchdog timeout ({}ms) going neutral", WATCHDOG_MS);
@@ -99,47 +99,82 @@ fn main() -> Result<()> {
                     msg.chan1_raw, msg.chan2_raw, msg.chan3_raw, msg.chan4_raw,
                     msg.chan5_raw, msg.chan6_raw, msg.chan7_raw, msg.chan8_raw,
                 ];
-
                 log::debug!(
-                    "RC_CHANNELS_OVERRIDE from sys#{}: {:?}",
-                    msg.target_system, raw_values,
+                    "RC_CHANNELS_OVERRIDE from sys#{} comp#{} (target_sys#{}): {:?}",
+                    header.system_id, header.component_id, msg.target_system, raw_values,
                 );
-
-                for ch_block in app.channel_blocks.iter().flatten() {
-                    let mav_ch = (ch_block.mavlink_channel - 1) as usize;
-                    if mav_ch >= raw_values.len() {
-                        continue;
-                    }
-                    let raw_val = raw_values[mav_ch];
-
-                    // Translate raw MAVLink pulse width to calibrated PWM duty count.
-                    let duty = pwm::mavlink_raw_to_pwm(
-                        raw_val, ch_block.min, ch_block.max, ch_block.neutral,
-                    );
-
-                    let new_value = match active_outputs.get(&ch_block.pwm_channel) {
-                        Some(prev) if prev.value == duty => duty,
-                        Some(prev) => pwm::slew(prev.value, duty, ch_block.max_step),
-                        None => duty,
-                    };
-
-                    active_outputs.insert(
-                        ch_block.pwm_channel,
-                        Output {
-                            channel: to_pca_channel(ch_block.pwm_channel),
-                            value: new_value,
-                        },
-                    );
-                }
-
-                apply_all(&mut pwm_dev, &app, &active_outputs)
-                    .context("apply PWM outputs")?;
+                process_raw_channels(&mut pwm_dev, &app, &mut active_outputs, &raw_values)?;
+            }
+            mavlink::common::MavMessage::RC_CHANNELS_RAW(msg) => {
+                let raw_values: Vec<u16> = vec![
+                    msg.chan1_raw, msg.chan2_raw, msg.chan3_raw, msg.chan4_raw,
+                    msg.chan5_raw, msg.chan6_raw, msg.chan7_raw, msg.chan8_raw,
+                ];
+                log::debug!(
+                    "RC_CHANNELS_RAW from sys#{} comp#{}: {:?}",
+                    header.system_id, header.component_id, raw_values,
+                );
+                process_raw_channels(&mut pwm_dev, &app, &mut active_outputs, &raw_values)?;
+            }
+            mavlink::common::MavMessage::SERVO_OUTPUT_RAW(msg) => {
+                let raw_values: Vec<u16> = vec![
+                    msg.servo1_raw, msg.servo2_raw, msg.servo3_raw, msg.servo4_raw,
+                    msg.servo5_raw, msg.servo6_raw, msg.servo7_raw, msg.servo8_raw,
+                ];
+                log::debug!(
+                    "SERVO_OUTPUT_RAW from sys#{} comp#{}: {:?}",
+                    header.system_id, header.component_id, raw_values,
+                );
+                process_raw_channels(&mut pwm_dev, &app, &mut active_outputs, &raw_values)?;
             }
             _ => {
                 log::debug!("Ignoring MAVLink message: {:?}", msg);
             }
         }
     }
+}
+
+/// Translate 8 raw MAVLink channel values into slewed PWM duty counts and write
+/// them to the PCA9685.
+///
+/// Shared by every RC-bearing message type (`RC_CHANNELS_OVERRIDE`,
+/// `RC_CHANNELS_RAW`, `SERVO_OUTPUT_RAW`) since they all carry the same 8
+/// raw pulse-width channels. `raw_values` is indexed by MAVLink channel
+/// position (0-based), matching the order the sending GCS emitted.
+fn process_raw_channels(
+    pwm_dev: &mut PwmDriver,
+    app: &AppConfig,
+    active_outputs: &mut HashMap<u8, Output>,
+    raw_values: &[u16],
+) -> Result<()> {
+    for ch_block in app.channel_blocks.iter().flatten() {
+        let mav_ch = (ch_block.mavlink_channel - 1) as usize;
+        if mav_ch >= raw_values.len() {
+            continue;
+        }
+        let raw_val = raw_values[mav_ch];
+
+        // Translate raw MAVLink pulse width to calibrated PWM duty count.
+        let duty = pwm::mavlink_raw_to_pwm(
+            raw_val, ch_block.min, ch_block.max, ch_block.neutral,
+        );
+
+        let new_value = match active_outputs.get(&ch_block.pwm_channel) {
+            Some(prev) if prev.value == duty => duty,
+            Some(prev) => pwm::slew(prev.value, duty, ch_block.max_step),
+            None => duty,
+        };
+
+        active_outputs.insert(
+            ch_block.pwm_channel,
+            Output {
+                channel: to_pca_channel(ch_block.pwm_channel),
+                value: new_value,
+            },
+        );
+    }
+
+    apply_all(pwm_dev, app, active_outputs).context("apply PWM outputs")
 }
 
 /// Wrapper around the PCA9685 hardware abstraction.
@@ -188,7 +223,7 @@ fn set_prescale(pwm_dev: &mut PwmDriver, prescale: u8) -> Result<()> {
 }
 
 /// Receive a MAVLink message from the UDP socket, returning None on timeout.
-fn recv_from(socket: &UdpSocket, buf: &mut [u8; 4096]) -> Option<mavlink::common::MavMessage> {
+fn recv_from(socket: &UdpSocket, buf: &mut [u8; 4096]) -> Option<(mavlink::MavHeader, mavlink::common::MavMessage)> {
     match socket.recv_from(buf) {
         Ok((received, _addr)) => {
             if received > 0 {
@@ -208,10 +243,13 @@ fn recv_from(socket: &UdpSocket, buf: &mut [u8; 4096]) -> Option<mavlink::common
 }
 
 /// Parse raw bytes as a MAVLink V2 message.
-fn parse_mavlink(data: &[u8]) -> Option<mavlink::common::MavMessage> {
+///
+/// Returns the packet header (which carries the source system/component id)
+/// alongside the decoded message, so callers can log who sent what.
+fn parse_mavlink(data: &[u8]) -> Option<(mavlink::MavHeader, mavlink::common::MavMessage)> {
     let mut reader = PeekReader::new(data);
     match mavlink::read_v2_msg::<mavlink::common::MavMessage, _>(&mut reader) {
-        Ok((_header, msg)) => Some(msg),
+        Ok((header, msg)) => Some((header, msg)),
         Err(e) => {
             log::debug!("Parse error: {}", e);
             None
