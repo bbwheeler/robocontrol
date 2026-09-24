@@ -172,14 +172,20 @@ fn process_raw_channels(
             raw_val, ch_block.min, ch_block.max, ch_block.neutral,
         );
 
-        let new_value = match active_outputs.get(&ch_block.pwm_channel) {
-            Some(prev) if prev.value == duty => duty,
-            Some(prev) => pwm::slew(prev.value, duty, ch_block.max_step),
-            None => duty,
+        let (prev_channel, new_value) = match active_outputs.get(&ch_block.pwm_channel) {
+            Some(prev) if prev.value == duty => (Some(prev.channel.clone()), duty),
+            Some(prev) => (Some(prev.channel.clone()), pwm::slew(prev.value, duty, ch_block.max_step)),
+            None => (None, duty),
         };
 
-        let channel = to_pca_channel(ch_block.pwm_channel)
-            .with_context(|| format!("pwm_channel {} is out of range (valid 0..=15)", ch_block.pwm_channel))?;
+        // Reuse the `Channel` cached on the previous `Output` (populated at
+        // startup). `to_pca_channel` is only the defensive fallback for a
+        // channel that was never pre-populated (unreachable in practice).
+        let channel = match prev_channel {
+            Some(ch) => ch,
+            None => to_pca_channel(ch_block.pwm_channel)
+                .with_context(|| format!("pwm_channel {} is out of range (valid 0..=15)", ch_block.pwm_channel))?,
+        };
         active_outputs.insert(
             ch_block.pwm_channel,
             Output {
