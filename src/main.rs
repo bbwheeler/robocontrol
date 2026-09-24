@@ -77,6 +77,7 @@ fn main() -> Result<()> {
     apply_all(&mut pwm_dev, &app, &active_outputs).context("apply startup neutral outputs")?;
 
     let mut last_message_time = Instant::now();
+    let mut failsafe = false;
 
     loop {
         let now = Instant::now();
@@ -86,15 +87,23 @@ fn main() -> Result<()> {
         let (header, msg) = match recv_from(&udp, &mut [0u8; 4096]) {
             Some(m) => m,
             None if now.duration_since(last_message_time) > Duration::from_millis(WATCHDOG_MS) => {
-                log::warn!("Watchdog timeout ({}ms) going neutral", WATCHDOG_MS);
-                send_neutral(&mut pwm_dev, &app, &active_outputs)?;
-                last_message_time = now;
+                // Latched failsafe: only drive the neutral pulse once when the
+                // watchdog first engages. While latched, skip the redundant I2C
+                // write on each subsequent loop iteration. `last_message_time` is
+                // deliberately NOT reset, so the latch holds until a real MAVLink
+                // message arrives (which re-arms the system below).
+                if !failsafe {
+                    log::warn!("Watchdog timeout ({}ms) going neutral", WATCHDOG_MS);
+                    send_neutral(&mut pwm_dev, &app, &active_outputs)?;
+                    failsafe = true;
+                }
                 continue;
             }
             None => continue,
         };
 
         last_message_time = now;
+        failsafe = false;
 
         match msg {
             mavlink::common::MavMessage::PARAM_VALUE(_) | mavlink::common::MavMessage::HEARTBEAT(_) | mavlink::common::MavMessage::STATUSTEXT(_) => {} // Ignore param values and common telemetry.
