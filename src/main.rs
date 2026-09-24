@@ -7,7 +7,7 @@
 mod config;
 mod pwm;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use config::AppConfig;
 use linux_embedded_hal::I2cdev;
 use mavlink::peek_reader::PeekReader;
@@ -62,10 +62,14 @@ fn main() -> Result<()> {
     // Apply neutral pulses to all channels on startup (ESC arming).
     let mut active_outputs: HashMap<u8, Output> = HashMap::new();
     for ch_block in app.channel_blocks.iter().flatten() {
+        let channel = match to_pca_channel(ch_block.pwm_channel) {
+            Some(ch) => ch,
+            None => bail!("pwm_channel {} is out of range (valid 0..=15)", ch_block.pwm_channel),
+        };
         active_outputs.insert(
             ch_block.pwm_channel,
             Output {
-                channel: to_pca_channel(ch_block.pwm_channel),
+                channel,
                 value: ch_block.neutral,
             },
         );
@@ -165,10 +169,12 @@ fn process_raw_channels(
             None => duty,
         };
 
+        let channel = to_pca_channel(ch_block.pwm_channel)
+            .with_context(|| format!("pwm_channel {} is out of range (valid 0..=15)", ch_block.pwm_channel))?;
         active_outputs.insert(
             ch_block.pwm_channel,
             Output {
-                channel: to_pca_channel(ch_block.pwm_channel),
+                channel,
                 value: new_value,
             },
         );
@@ -286,10 +292,12 @@ fn send_neutral(pwm_dev: &mut PwmDriver, app: &AppConfig, active_outputs: &HashM
             Some(prev) => pwm::slew(prev.value, ch_block.neutral, ch_block.max_step),
             None => ch_block.neutral,
         };
+        let channel = to_pca_channel(ch_block.pwm_channel)
+            .with_context(|| format!("pwm_channel {} is out of range (valid 0..=15)", ch_block.pwm_channel))?;
         neutral_outputs.insert(
             ch_block.pwm_channel,
             Output {
-                channel: to_pca_channel(ch_block.pwm_channel),
+                channel,
                 value: new_value,
             },
         );
@@ -299,16 +307,29 @@ fn send_neutral(pwm_dev: &mut PwmDriver, app: &AppConfig, active_outputs: &HashM
 }
 
 /// Convert the config's raw PWM channel number (0–15) into the pca9685 Channel enum.
-fn to_pca_channel(ch: u8) -> Channel {
+///
+/// Returns `None` for any value >= 16: the PCA9685 exposes only channels 0–15,
+/// and callers must surface a clear error rather than silently mapping an
+/// invalid channel onto C0. (Normally unreachable — `config::build` rejects
+/// out-of-range `pwm_channel` values at config load time — but defense in depth.)
+fn to_pca_channel(ch: u8) -> Option<Channel> {
     match ch {
-        0  => Channel::C0,  1  => Channel::C1,
-        2  => Channel::C2,  3  => Channel::C3,
-        4  => Channel::C4,  5  => Channel::C5,
-        6  => Channel::C6,  7  => Channel::C7,
-        8  => Channel::C8,  9  => Channel::C9,
-        10 => Channel::C10, 11 => Channel::C11,
-        12 => Channel::C12, 13 => Channel::C13,
-        14 => Channel::C14, 15 => Channel::C15,
-        _ => Channel::C0,
+        0  => Some(Channel::C0),
+        1  => Some(Channel::C1),
+        2  => Some(Channel::C2),
+        3  => Some(Channel::C3),
+        4  => Some(Channel::C4),
+        5  => Some(Channel::C5),
+        6  => Some(Channel::C6),
+        7  => Some(Channel::C7),
+        8  => Some(Channel::C8),
+        9  => Some(Channel::C9),
+        10 => Some(Channel::C10),
+        11 => Some(Channel::C11),
+        12 => Some(Channel::C12),
+        13 => Some(Channel::C13),
+        14 => Some(Channel::C14),
+        15 => Some(Channel::C15),
+        _ => None,
     }
 }

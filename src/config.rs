@@ -107,6 +107,20 @@ fn build(raw: RawConfig) -> Result<AppConfig> {
     for (i, raw_ch) in raw.channel.iter().enumerate() {
         let ch_id = raw_ch.pwm_channel;
 
+        // Validate the PWM channel number at config load time (code review
+        // item #19): the PCA9685 exposes channels 0–15 only, and an
+        // out-of-range value would otherwise index into `blocks` below and
+        // panic with an opaque "index out of bounds" that does not name the
+        // offending field or config entry.
+        if ch_id >= 16 {
+            bail!(
+                "Channel entry {} (index {}): pwm_channel {} is out of range (valid 0..=15)",
+                ch_id,
+                i,
+                ch_id,
+            );
+        }
+
         // Validate pulse-width bounds: neutral must sit inside [min, max].
         if raw_ch.min > raw_ch.neutral {
             bail!(
