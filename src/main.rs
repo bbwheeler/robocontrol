@@ -19,13 +19,6 @@ use pwm_pca9685::{Address, Channel, Pca9685};
 
 const WATCHDOG_MS: u64 = 500;
 
-/// Internal representation of a PWM channel output.
-#[derive(Debug, Clone)]
-struct Output {
-    channel: Channel,
-    pub value: u16,
-}
-
 fn main() -> Result<()> {
     env_logger::init();
 
@@ -60,7 +53,7 @@ fn main() -> Result<()> {
     }
 
     // Apply neutral pulses to all channels on startup (ESC arming).
-    let mut active_outputs: HashMap<u8, Output> = HashMap::new();
+    let mut active_outputs: HashMap<u8, pwm::AbsoluteControlOutput> = HashMap::new();
     for ch_block in app.channel_blocks.iter().flatten() {
         let channel = match to_pca_channel(ch_block.pwm_channel) {
             Some(ch) => ch,
@@ -68,7 +61,7 @@ fn main() -> Result<()> {
         };
         active_outputs.insert(
             ch_block.pwm_channel,
-            Output {
+            pwm::AbsoluteControlOutput {
                 channel,
                 value: ch_block.neutral,
             },
@@ -157,7 +150,7 @@ fn main() -> Result<()> {
 fn process_raw_channels(
     pwm_dev: &mut PwmDriver,
     app: &AppConfig,
-    active_outputs: &mut HashMap<u8, Output>,
+    active_outputs: &mut HashMap<u8, pwm::AbsoluteControlOutput>,
     raw_values: &[u16],
 ) -> Result<()> {
     for ch_block in app.channel_blocks.iter().flatten() {
@@ -178,7 +171,7 @@ fn process_raw_channels(
             None => (None, duty),
         };
 
-        // Reuse the `Channel` cached on the previous `Output` (populated at
+        // Reuse the `Channel` cached on the previous `AbsoluteControlOutput` (populated at
         // startup). `to_pca_channel` is only the defensive fallback for a
         // channel that was never pre-populated (unreachable in practice).
         let channel = match prev_channel {
@@ -188,7 +181,7 @@ fn process_raw_channels(
         };
         active_outputs.insert(
             ch_block.pwm_channel,
-            Output {
+            pwm::AbsoluteControlOutput {
                 channel,
                 value: new_value,
             },
@@ -286,7 +279,7 @@ fn parse_mavlink(data: &[u8]) -> Option<(mavlink::MavHeader, mavlink::common::Ma
 /// silently accepted by the chip's register clamping — which would hide the
 /// underlying bug (e.g. a config typo with swapped min/max, or a computed
 /// value that escaped the scaling helpers).
-fn apply_all(pwm_dev: &mut PwmDriver, app: &AppConfig, outputs: &HashMap<u8, Output>) -> Result<()> {
+fn apply_all(pwm_dev: &mut PwmDriver, app: &AppConfig, outputs: &HashMap<u8, pwm::AbsoluteControlOutput>) -> Result<()> {
     for (channel, output) in outputs {
         let value = match app.channel_bounds(*channel) {
             Some((min, max)) => guard_pwm_value(*channel, output.value, min, max),
@@ -300,8 +293,8 @@ fn apply_all(pwm_dev: &mut PwmDriver, app: &AppConfig, outputs: &HashMap<u8, Out
 }
 
 /// Send neutral to all channels (watchdog failsafe).
-fn send_neutral(pwm_dev: &mut PwmDriver, app: &AppConfig, active_outputs: &HashMap<u8, Output>) -> Result<()> {
-    let mut neutral_outputs: HashMap<u8, Output> = HashMap::new();
+fn send_neutral(pwm_dev: &mut PwmDriver, app: &AppConfig, active_outputs: &HashMap<u8, pwm::AbsoluteControlOutput>) -> Result<()> {
+    let mut neutral_outputs: HashMap<u8, pwm::AbsoluteControlOutput> = HashMap::new();
     for ch_block in app.channel_blocks.iter().flatten() {
         let new_value = match active_outputs.get(&ch_block.pwm_channel) {
             Some(prev) => pwm::slew(prev.value, ch_block.neutral, ch_block.max_step),
@@ -311,7 +304,7 @@ fn send_neutral(pwm_dev: &mut PwmDriver, app: &AppConfig, active_outputs: &HashM
             .with_context(|| format!("pwm_channel {} is out of range (valid 0..=15)", ch_block.pwm_channel))?;
         neutral_outputs.insert(
             ch_block.pwm_channel,
-            Output {
+            pwm::AbsoluteControlOutput {
                 channel,
                 value: new_value,
             },
