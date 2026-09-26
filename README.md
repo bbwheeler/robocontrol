@@ -136,5 +136,5 @@ const PCA9685_ADDRESS: u8 = 0x41;  // e.g., A0 tied high
 
 - **Always** test with the car's drive wheels off the ground first.
 - Start with a small `THROTTLE_STEP_US` (e.g., 25 µs) and increase gradually.
-- The program sends a neutral-throttle pulse on exit (via `Drop` on `PwmDriver`).
+- The program sends a neutral-throttle pulse on startup (ESC arming) and drives all channels neutral on the 500 ms watchdog failsafe when MAVLink messages stop arriving.
 - If the program crashes, the ESC will see no signal and most will failsafe to neutral.

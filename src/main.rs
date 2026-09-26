@@ -32,11 +32,12 @@ fn main() -> Result<()> {
     // Initialize PCA9685 driver using linux-embedded-hal.
     let dev_path = &app.static_config.i2c.path;
     let addr = app.static_config.i2c.address;
-    let mut pwm_dev = initialize_pca9685(dev_path, addr)
+    let mut pwm_dev = open_pca9685(dev_path, addr)
         .with_context(|| format!("init pca9685 on {}", dev_path))?;
-    set_prescale(&mut pwm_dev, app.static_config.pwm.prescale)
-        .context("set prescale")?;
-    pwm_dev.enable().context("enable pca9685")?;
+    pwm_dev
+        .set_prescale(app.static_config.pwm.prescale)
+        .context("PCA9685 set_prescale")?;
+    pwm_dev.enable().context("PCA9685 enable")?;
     log::info!("PCA9685 initialized on {}", dev_path);
 
     // Log configured channels.
@@ -148,7 +149,7 @@ fn main() -> Result<()> {
 /// raw pulse-width channels. `raw_values` is indexed by MAVLink channel
 /// position (0-based), matching the order the sending GCS emitted.
 fn process_raw_channels(
-    pwm_dev: &mut PwmDriver,
+    pwm_dev: &mut Pca9685<I2cdev>,
     app: &AppConfig,
     active_outputs: &mut HashMap<u8, pwm::AbsoluteControlOutput>,
     raw_values: &[u16],
@@ -191,49 +192,14 @@ fn process_raw_channels(
     apply_all(pwm_dev, app, active_outputs).context("apply PWM outputs")
 }
 
-/// Wrapper around the PCA9685 hardware abstraction.
-struct PwmDriver {
-    pca: Pca9685<I2cdev>,
-}
-
-impl PwmDriver {
-    fn new(path: &str, addr: u8) -> Result<Self> {
-        let i2c = I2cdev::new(path)
-            .with_context(|| format!("Failed to open I2C bus '{path}'"))?;
-        let address = Address::from(addr);
-        let pca = Pca9685::new(i2c, address)
-            .with_context(|| "PCA9685 new".to_string())?;
-        Ok(Self { pca })
-    }
-
-    fn set_prescale(&mut self, prescale: u8) -> Result<()> {
-        self.pca
-            .set_prescale(prescale)
-            .context("PCA9685 set_prescale")
-    }
-
-    fn enable(&mut self) -> Result<()> {
-        self.pca
-            .enable()
-            .context("PCA9685 enable")
-    }
-
-    fn set_channel_on_off(&mut self, ch: Channel, on: u16, off: u16) -> Result<()> {
-        self.pca
-            .set_channel_on_off(ch, on, off)
-            .with_context(|| format!("PCA9685 set_channel_on_off on channel {:?}", ch))
-    }
-}
-
 /// Open and initialize a PCA9685 device on the given I2C bus.
-fn initialize_pca9685(path: &str, addr: u8) -> Result<PwmDriver> {
-    let dev = PwmDriver::new(path, addr)?;
-    Ok(dev)
-}
-
-/// Set the PCA9685 prescaler to achieve the desired PWM frequency.
-fn set_prescale(pwm_dev: &mut PwmDriver, prescale: u8) -> Result<()> {
-    pwm_dev.set_prescale(prescale)
+fn open_pca9685(path: &str, addr: u8) -> Result<Pca9685<I2cdev>> {
+    let i2c = I2cdev::new(path)
+        .with_context(|| format!("Failed to open I2C bus '{path}'"))?;
+    let address = Address::from(addr);
+    let pca = Pca9685::new(i2c, address)
+        .with_context(|| "PCA9685 new".to_string())?;
+    Ok(pca)
 }
 
 /// Receive a MAVLink message from the UDP socket, returning None on timeout.
@@ -279,7 +245,7 @@ fn parse_mavlink(data: &[u8]) -> Option<(mavlink::MavHeader, mavlink::common::Ma
 /// silently accepted by the chip's register clamping — which would hide the
 /// underlying bug (e.g. a config typo with swapped min/max, or a computed
 /// value that escaped the scaling helpers).
-fn apply_all(pwm_dev: &mut PwmDriver, app: &AppConfig, outputs: &HashMap<u8, pwm::AbsoluteControlOutput>) -> Result<()> {
+fn apply_all(pwm_dev: &mut Pca9685<I2cdev>, app: &AppConfig, outputs: &HashMap<u8, pwm::AbsoluteControlOutput>) -> Result<()> {
     for (channel, output) in outputs {
         let value = match app.channel_bounds(*channel) {
             Some((min, max)) => guard_pwm_value(*channel, output.value, min, max),
@@ -287,13 +253,15 @@ fn apply_all(pwm_dev: &mut PwmDriver, app: &AppConfig, outputs: &HashMap<u8, pwm
             // outputs are only built from configured channels) — pass through.
             None => output.value,
         };
-        pwm_dev.set_channel_on_off(output.channel, 0, value)?;
+        pwm_dev
+            .set_channel_on_off(output.channel, 0, value)
+            .with_context(|| format!("PCA9685 set_channel_on_off on channel {:?}", output.channel))?;
     }
     Ok(())
 }
 
 /// Send neutral to all channels (watchdog failsafe).
-fn send_neutral(pwm_dev: &mut PwmDriver, app: &AppConfig, active_outputs: &HashMap<u8, pwm::AbsoluteControlOutput>) -> Result<()> {
+fn send_neutral(pwm_dev: &mut Pca9685<I2cdev>, app: &AppConfig, active_outputs: &HashMap<u8, pwm::AbsoluteControlOutput>) -> Result<()> {
     let mut neutral_outputs: HashMap<u8, pwm::AbsoluteControlOutput> = HashMap::new();
     for ch_block in app.channel_blocks.iter().flatten() {
         let new_value = match active_outputs.get(&ch_block.pwm_channel) {
