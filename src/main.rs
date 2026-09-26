@@ -53,7 +53,10 @@ fn main() -> Result<()> {
         );
     }
 
-    // Apply neutral pulses to all channels on startup (ESC arming).
+    // Apply neutral pulses to all channels on startup (ESC arming window).
+    // Written once here, then the main loop begins; the PCA9685 keeps the last
+    // written neutral pulse until the first MAVLink command overwrites it,
+    // covering the ~1–2 s neutral window most ESCs need to arm.
     let mut active_outputs: HashMap<u8, pwm::AbsoluteControlOutput> = HashMap::new();
     for ch_block in app.channel_blocks.iter().flatten() {
         let channel = match to_pca_channel(ch_block.pwm_channel) {
@@ -261,6 +264,11 @@ fn apply_all(pwm_dev: &mut Pca9685<I2cdev>, app: &AppConfig, outputs: &HashMap<u
 }
 
 /// Send neutral to all channels (watchdog failsafe).
+///
+/// Applies *slewed* neutral: each channel moves toward its configured
+/// `neutral` value limited by `max_step`. This is **not** a dedicated ESC
+/// disarm (low-pulse) sequence — a hard disconnect relies on the ESC's own
+/// watchdog/failsafe behavior, plus this slewed-to-neutral output.
 fn send_neutral(pwm_dev: &mut Pca9685<I2cdev>, app: &AppConfig, active_outputs: &HashMap<u8, pwm::AbsoluteControlOutput>) -> Result<()> {
     let mut neutral_outputs: HashMap<u8, pwm::AbsoluteControlOutput> = HashMap::new();
     for ch_block in app.channel_blocks.iter().flatten() {

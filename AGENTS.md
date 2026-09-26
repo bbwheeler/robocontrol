@@ -16,6 +16,7 @@ This runs on a Raspberry Pi with a PCA9685 on the I2C interface — it will not 
 ## Gotchas
 
 - **ESC arming**: On startup the program sends a 2-second neutral pulse (line 219). If the ESC needs custom calibration sequence, extend `arm_esc()`.
+  - On watchdog failsafe (link loss) the channels go to *slewed* neutral; the system does **not** emit a dedicated ESC disarm (low-pulse) sequence and relies on the ESC's own failsafe behavior.
 - **Watchdog failsafe**: After 500ms without a MAVLink message, all channels go neutral.
 - **MAVLink ports**: Default listens on `udp in :14550` (set by `[mav].port` in config).
 - **Channel mapping**: Each channel entry maps one PWM hardware channel to one MAVLink raw value (1000–2000 µs range) and/or scaled input (-10000–10000). Look at `translate_message()` and the `mavlink_*_to_pwm()` helpers for scaling logic.
