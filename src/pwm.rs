@@ -103,9 +103,13 @@ pub fn mavlink_raw_to_pwm(input: u16, min: u16, max: u16, neutral: u16) -> u16 {
 
     let clamped = input.clamp(APP_RAW_PULSE_MIN as u16, APP_RAW_PULSE_MAX as u16) as i32;
 
-    // Map [1000..2000] → [-SCALED_BOUND..SCALED_BOUND] (scaled)
-    let scaled: i32 =
-        (clamped - APP_RAW_PULSE_MIN) * SCALED_BOUND / (APP_RAW_PULSE_MAX - APP_RAW_PULSE_MIN);
+    // Center at 1500 and scale to [-SCALED_BOUND, +SCALED_BOUND]. At 1000 µs
+    // (fully down) the result is -SCALED_BOUND (min position); at 2000 µs
+    // (fully up) the result is +SCALED_BOUND (max position); at 1500 µs
+    // (center) the result is 0, which maps to `neutral`.
+    let scaled: i32 = (clamped - (APP_RAW_PULSE_MIN + APP_RAW_PULSE_MAX) / 2)
+        * (2 * SCALED_BOUND)
+        / (APP_RAW_PULSE_MAX - APP_RAW_PULSE_MIN);
 
     scaled_to_pwm(scaled, min, max, neutral)
 }
@@ -114,6 +118,13 @@ pub fn mavlink_raw_to_pwm(input: u16, min: u16, max: u16, neutral: u16) -> u16 {
 ///
 /// Positive values map from `neutral` → `max`, negative from `neutral` → `min`.
 pub fn scaled_to_pwm(input: i32, min: u16, max: u16, neutral: u16) -> u16 {
+    // The `i32::MAX` "magic" value is a caller-level sentinel meaning
+    // "use neutral" (mirroring the `u16::MAX` sentinel on the raw
+    // MAVLink scale handled by `mavlink_raw_to_pwm`).
+    if input == i32::MAX {
+        return neutral;
+    }
+
     let clamped = input.clamp(-SCALED_BOUND, SCALED_BOUND);
 
     if clamped >= 0 {
