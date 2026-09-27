@@ -11,7 +11,6 @@ use anyhow::{bail, Context, Result};
 use config::AppConfig;
 use linux_embedded_hal::I2cdev;
 use mavlink::peek_reader::PeekReader;
-use std::collections::HashMap;
 use std::net::UdpSocket;
 use std::time::{Duration, Instant};
 use pwm::guard_pwm_value;
@@ -57,19 +56,17 @@ fn main() -> Result<()> {
     // Written once here, then the main loop begins; the PCA9685 keeps the last
     // written neutral pulse until the first MAVLink command overwrites it,
     // covering the ~1–2 s neutral window most ESCs need to arm.
-    let mut active_outputs: HashMap<u8, pwm::AbsoluteControlOutput> = HashMap::new();
+    let mut active_outputs: Vec<pwm::AbsoluteControlOutput> = Vec::new();
     for ch_block in app.channel_blocks.iter().flatten() {
         let channel = match to_pca_channel(ch_block.pwm_channel) {
             Some(ch) => ch,
             None => bail!("pwm_channel {} is out of range (valid 0..=15)", ch_block.pwm_channel),
         };
-        active_outputs.insert(
-            ch_block.pwm_channel,
-            pwm::AbsoluteControlOutput {
-                channel,
-                value: ch_block.neutral,
-            },
-        );
+        active_outputs.push(pwm::AbsoluteControlOutput {
+            pwm_channel: ch_block.pwm_channel,
+            channel,
+            value: ch_block.neutral,
+        });
     }
     apply_all(&mut pwm_dev, &app, &active_outputs).context("apply startup neutral outputs")?;
 
@@ -154,7 +151,7 @@ fn main() -> Result<()> {
 fn process_raw_channels(
     pwm_dev: &mut Pca9685<I2cdev>,
     app: &AppConfig,
-    active_outputs: &mut HashMap<u8, pwm::AbsoluteControlOutput>,
+    active_outputs: &mut Vec<pwm::AbsoluteControlOutput>,
     raw_values: &[u16],
 ) -> Result<()> {
     for ch_block in app.channel_blocks.iter().flatten() {
@@ -169,27 +166,30 @@ fn process_raw_channels(
             raw_val, ch_block.min, ch_block.max, ch_block.neutral,
         );
 
-        let (prev_channel, new_value) = match active_outputs.get(&ch_block.pwm_channel) {
-            Some(prev) if prev.value == duty => (Some(prev.channel.clone()), duty),
-            Some(prev) => (Some(prev.channel.clone()), pwm::slew(prev.value, duty, ch_block.max_step)),
-            None => (None, duty),
-        };
-
-        // Reuse the `Channel` cached on the previous `AbsoluteControlOutput` (populated at
-        // startup). `to_pca_channel` is only the defensive fallback for a
-        // channel that was never pre-populated (unreachable in practice).
-        let channel = match prev_channel {
-            Some(ch) => ch,
-            None => to_pca_channel(ch_block.pwm_channel)
-                .with_context(|| format!("pwm_channel {} is out of range (valid 0..=15)", ch_block.pwm_channel))?,
-        };
-        active_outputs.insert(
-            ch_block.pwm_channel,
-            pwm::AbsoluteControlOutput {
-                channel,
-                value: new_value,
-            },
-        );
+        // Reuse the `Channel` cached on the previous `AbsoluteControlOutput`
+        // (populated at startup) and update `value` in place. `to_pca_channel`
+        // is only the defensive fallback for a channel that was never
+        // pre-populated (unreachable in practice).
+        match active_outputs.iter().position(|o| o.pwm_channel == ch_block.pwm_channel) {
+            Some(pos) => {
+                let prev_value = active_outputs[pos].value;
+                let new_value = if prev_value == duty {
+                    duty
+                } else {
+                    pwm::slew(prev_value, duty, ch_block.max_step)
+                };
+                active_outputs[pos].value = new_value;
+            }
+            None => {
+                let channel = to_pca_channel(ch_block.pwm_channel)
+                    .with_context(|| format!("pwm_channel {} is out of range (valid 0..=15)", ch_block.pwm_channel))?;
+                active_outputs.push(pwm::AbsoluteControlOutput {
+                    pwm_channel: ch_block.pwm_channel,
+                    channel,
+                    value: duty,
+                });
+            }
+        }
     }
 
     apply_all(pwm_dev, app, active_outputs).context("apply PWM outputs")
@@ -248,10 +248,10 @@ fn parse_mavlink(data: &[u8]) -> Option<(mavlink::MavHeader, mavlink::common::Ma
 /// silently accepted by the chip's register clamping — which would hide the
 /// underlying bug (e.g. a config typo with swapped min/max, or a computed
 /// value that escaped the scaling helpers).
-fn apply_all(pwm_dev: &mut Pca9685<I2cdev>, app: &AppConfig, outputs: &HashMap<u8, pwm::AbsoluteControlOutput>) -> Result<()> {
-    for (channel, output) in outputs {
-        let value = match app.channel_bounds(*channel) {
-            Some((min, max)) => guard_pwm_value(*channel, output.value, min, max),
+fn apply_all(pwm_dev: &mut Pca9685<I2cdev>, app: &AppConfig, outputs: &[pwm::AbsoluteControlOutput]) -> Result<()> {
+    for output in outputs {
+        let value = match app.channel_bounds(output.pwm_channel) {
+            Some((min, max)) => guard_pwm_value(output.pwm_channel, output.value, min, max),
             // No bounds are known for this channel (shouldn't happen, as
             // outputs are only built from configured channels) — pass through.
             None => output.value,
@@ -269,22 +269,21 @@ fn apply_all(pwm_dev: &mut Pca9685<I2cdev>, app: &AppConfig, outputs: &HashMap<u
 /// `neutral` value limited by `max_step`. This is **not** a dedicated ESC
 /// disarm (low-pulse) sequence — a hard disconnect relies on the ESC's own
 /// watchdog/failsafe behavior, plus this slewed-to-neutral output.
-fn send_neutral(pwm_dev: &mut Pca9685<I2cdev>, app: &AppConfig, active_outputs: &HashMap<u8, pwm::AbsoluteControlOutput>) -> Result<()> {
-    let mut neutral_outputs: HashMap<u8, pwm::AbsoluteControlOutput> = HashMap::new();
+fn send_neutral(pwm_dev: &mut Pca9685<I2cdev>, app: &AppConfig, active_outputs: &[pwm::AbsoluteControlOutput]) -> Result<()> {
+    let mut neutral_outputs: Vec<pwm::AbsoluteControlOutput> = Vec::new();
     for ch_block in app.channel_blocks.iter().flatten() {
-        let new_value = match active_outputs.get(&ch_block.pwm_channel) {
-            Some(prev) => pwm::slew(prev.value, ch_block.neutral, ch_block.max_step),
+        let prev = active_outputs.iter().find(|o| o.pwm_channel == ch_block.pwm_channel);
+        let new_value = match prev {
+            Some(p) => pwm::slew(p.value, ch_block.neutral, ch_block.max_step),
             None => ch_block.neutral,
         };
         let channel = to_pca_channel(ch_block.pwm_channel)
             .with_context(|| format!("pwm_channel {} is out of range (valid 0..=15)", ch_block.pwm_channel))?;
-        neutral_outputs.insert(
-            ch_block.pwm_channel,
-            pwm::AbsoluteControlOutput {
-                channel,
-                value: new_value,
-            },
-        );
+        neutral_outputs.push(pwm::AbsoluteControlOutput {
+            pwm_channel: ch_block.pwm_channel,
+            channel,
+            value: new_value,
+        });
     }
     apply_all(pwm_dev, app, &neutral_outputs).context("apply watchdog PWM outputs")?;
     Ok(())

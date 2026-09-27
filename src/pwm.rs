@@ -34,6 +34,7 @@ const SCALED_BOUND: i32 = 10_000;
 /// Represents a per-channel PWM output value and its associated hardware channel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AbsoluteControlOutput {
+    pub pwm_channel: u8,
     pub channel: Channel,
     pub value: u16,
 }
