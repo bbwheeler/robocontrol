@@ -119,6 +119,33 @@ If your ESC needs a specific calibration procedure (e.g., full-throttle then
 neutral on power-up), perform that **before** running this program, or extend
 the `arm_esc()` function accordingly.
 
+### ESC arming & failsafe (disarm) behavior
+
+**Arming window:** On startup, every configured channel is driven to its
+`neutral` pulse width and that write is issued once, immediately before the
+main control loop begins. The neutral pulse is therefore held for the duration
+the ESC needs to arm — the neutral state persists because the PCA9685 simply
+keeps outputting the last written pulse width as long as it stays powered,
+until the first MAVLink command overwrites it. (ESCs that require ~1–2 s of
+neutral on power-up arm during this window.)
+
+**Watchdog failsafe on link loss:** If no MAVLink message arrives for more
+than 500 ms (`WATCHDOG_MS`), the watchdog engages and drives *every* channel
+toward its `neutral` value, slewed by each channel's configured `max_step`
+(`send_neutral` → `pwm::slew`). The failsafe **latches**: it writes the
+slewed-neutral output only once when it first engages, then holds that state
+until a valid MAVLink message arrives again, which clears the latch and
+resumes normal channel control.
+
+**Known limitation — no dedicated disarm sequence:** This program does **not**
+send a dedicated ESC disarm sequence (e.g., a defined low pulse held for N ms).
+On a hard disconnect it relies entirely on the ESC's own watchdog/failsafe
+behavior, in addition to the slewed-to-neutral output above. If your ESC
+requires a specific disarm pulse sequence, you must choose config values
+(`max_step`, `neutral`) — or external wiring — that make the slewed-to-neutral
+behavior sufficient, or extend the code (see the **ESC arming** / **Watchdog
+failsafe** gotchas in `AGENTS.md`; `send_neutral()` is the function to modify).
+
 ---
 
 ## I2C Address
@@ -136,5 +163,5 @@ const PCA9685_ADDRESS: u8 = 0x41;  // e.g., A0 tied high
 
 - **Always** test with the car's drive wheels off the ground first.
 - Start with a small `THROTTLE_STEP_US` (e.g., 25 µs) and increase gradually.
-- The program sends a neutral-throttle pulse on exit (via `Drop` on `PwmDriver`).
+- The program sends a neutral-throttle pulse on startup (ESC arming) and drives all channels neutral on the 500 ms watchdog failsafe when MAVLink messages stop arriving.
 - If the program crashes, the ESC will see no signal and most will failsafe to neutral.

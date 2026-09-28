@@ -61,6 +61,18 @@ impl AppConfig {
     pub fn channel_count(&self) -> usize {
         self.channel_blocks.iter().filter(|c| c.is_some()).count()
     }
+
+    /// Returns the `(min, max)` pulse-width bounds for a PWM channel index,
+    /// or `None` if no channel is configured at that index.
+    ///
+    /// Used by the apply-time guard (code review item #16) to validate that a
+    /// PWM value is within the channel's calibrated range before it is written
+    /// to the hardware.
+    pub fn channel_bounds(&self, channel: u8) -> Option<(u16, u16)> {
+        self.channel_blocks[channel as usize]
+            .as_ref()
+            .map(|b| (b.min, b.max))
+    }
 }
 
 /// Optional control-channel designations (0–15 indices into `[[channel]]`).
@@ -94,6 +106,20 @@ fn build(raw: RawConfig) -> Result<AppConfig> {
 
     for (i, raw_ch) in raw.channel.iter().enumerate() {
         let ch_id = raw_ch.pwm_channel;
+
+        // Validate the PWM channel number at config load time (code review
+        // item #19): the PCA9685 exposes channels 0–15 only, and an
+        // out-of-range value would otherwise index into `blocks` below and
+        // panic with an opaque "index out of bounds" that does not name the
+        // offending field or config entry.
+        if ch_id >= 16 {
+            bail!(
+                "Channel entry {} (index {}): pwm_channel {} is out of range (valid 0..=15)",
+                ch_id,
+                i,
+                ch_id,
+            );
+        }
 
         // Validate pulse-width bounds: neutral must sit inside [min, max].
         if raw_ch.min > raw_ch.neutral {
